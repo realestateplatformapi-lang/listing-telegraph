@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import time
+from io import BytesIO
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -181,9 +182,38 @@ def extract_listing(source_url):
     blocked_markers = ("just a moment", "access denied", "checking your browser", "captcha")
     if not title or any(marker in title.lower() for marker in blocked_markers):
         raise ValueError("Не вдалося прочитати оголошення. Можливо, сайт запросив перевірку або змінив розмітку.")
-    listing = {"title": html.unescape(title).strip(), "description": html.unescape(description).strip(), "images": clean_images[:20], "source": response.url}
+    page_plain = html.unescape(re.sub(r"<[^>]*>", " ", response.text))
+    page_plain = re.sub(r"\s+", " ", page_plain)
+    listing = {"title": html.unescape(title).strip(), "description": html.unescape(description).strip(), "images": clean_images[:20], "source": response.url, "details": extract_details(page_plain)}
     LISTING_CACHE[cache_key] = (time.time(), listing)
     return listing
+
+
+def extract_details(page_text):
+    def match(pattern):
+        found = re.search(pattern, page_text, re.IGNORECASE)
+        return found.groups() if found else ()
+    price = match(r"(?<!\d)([\d\s\u00a0]+(?:[.,]\d+)?)\s*(USD|EUR|грн\.?|\$|€|₴)(?!\w)")
+    # Listings often show total/living/kitchen area as "72 / 20 / 30 m²".
+    area = match(r"(\d+(?:[.,]\d+)?)\s*/\s*\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\s*(?:м²|м2|m²|m2)") or match(r"(\d+(?:[.,]\d+)?)\s*(?:м²|м2|m²|m2)")
+    floor = match(r"(\d+)\s*(?:поверх|пов\.)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*поверх\s*(\d+)\s*-?\s*пов")
+    currency = {"$": "USD", "USD": "USD", "€": "EUR", "EUR": "EUR", "₴": "UAH", "грн": "UAH", "грн.": "UAH"}
+    return {"price": price[0].strip() if price else "", "currency": currency.get(price[1].upper(), "UAH") if price else "UAH", "area": area[0] if area else "", "floor": "/".join(floor) if floor else ""}
+
+
+def translate_to_english(text):
+    if not text.strip():
+        return ""
+    translated = []
+    # Translate paragraph by paragraph so the public endpoint stays within its size limit.
+    for part in text.splitlines() or [text]:
+        if not part.strip():
+            translated.append("")
+            continue
+        response = requests.get("https://translate.googleapis.com/translate_a/single", params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": part[:4500]}, timeout=15)
+        response.raise_for_status()
+        translated.append("".join(segment[0] for segment in response.json()[0] if segment[0]))
+    return "\n".join(translated)
 
 
 def token():
@@ -204,23 +234,91 @@ def publish(payload):
     images = payload.get("images", [])
     if not title or not isinstance(images, list):
         raise ValueError("Потрібні заголовок і коректний список фотографій.")
+    language = payload.get("language", "uk")
+    details = payload.get("details", {})
+    labels = {"uk": ("Ціна", "Площа", "Поверх", "Джерело: оголошення"), "en": ("Price", "Area", "Floor", "Source: listing")}
+    price_label, area_label, floor_label, source_label = labels.get(language, labels["uk"])
     content = []
+    detail_lines = [(price_label, f"{details.get('price', '')} {details.get('currency', '')}".strip()), (area_label, f"{details.get('area', '')} m²".strip()), (floor_label, details.get("floor", ""))]
+    for label, value in detail_lines:
+        if value:
+            content.append({"tag": "p", "children": [{"tag": "b", "children": [f"{label}: "]}, value]})
     for paragraph in text.splitlines():
         if paragraph.strip(): content.append({"tag": "p", "children": [paragraph.strip()]})
     for image in images[:20]:
         if isinstance(image, str) and image.startswith("https://"):
             content.append({"tag": "img", "attrs": {"src": image}})
     if source:
-        content.append({"tag": "p", "children": [{"tag": "a", "attrs": {"href": source}, "children": ["Джерело: оголошення"]}]})
+        content.append({"tag": "p", "children": [{"tag": "a", "attrs": {"href": source}, "children": [source_label]}]})
     result = requests.post(f"{TELEGRAPH_API}/createPage", json={"access_token": token(), "title": title[:256], "content": json.dumps(content, ensure_ascii=False), "return_content": False}, timeout=25).json()
     if not result.get("ok"):
         raise RuntimeError(result.get("error", "Telegraph не зміг створити сторінку."))
     return result["result"]["url"]
 
 
+def make_pdf(payload):
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    except ImportError as error:
+        raise RuntimeError("PDF-модуль не встановлено. Перезапустіть застосунок через start.command.") from error
+    title = html.escape(str(payload.get("title", "")).strip())
+    if not title:
+        raise ValueError("Потрібен заголовок для PDF.")
+    language = payload.get("language", "uk")
+    labels = {"uk": ("Ціна", "Площа", "Поверх", "Джерело"), "en": ("Price", "Area", "Floor", "Source")}
+    price_label, area_label, floor_label, source_label = labels.get(language, labels["uk"])
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_name = "Helvetica"
+    if os.path.exists(font_path):
+        pdfmetrics.registerFont(TTFont("DejaVu", font_path))
+        font_name = "DejaVu"
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle("listing", parent=styles["BodyText"], fontName=font_name, leading=17, spaceAfter=8)
+    heading = ParagraphStyle("listing-title", parent=styles["Title"], fontName=font_name, leading=28, textColor=colors.HexColor("#168acd"))
+    output = BytesIO()
+    document = SimpleDocTemplate(output, pagesize=A4, rightMargin=1.6 * cm, leftMargin=1.6 * cm, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
+    story = [Paragraph(title, heading), Spacer(1, 0.3 * cm)]
+    details = payload.get("details", {})
+    rows = [(price_label, f"{details.get('price', '')} {details.get('currency', '')}".strip()), (area_label, f"{details.get('area', '')} m²".strip()), (floor_label, details.get("floor", ""))]
+    rows = [[Paragraph(html.escape(label), normal), Paragraph(html.escape(value), normal)] for label, value in rows if value]
+    if rows:
+        table = Table(rows, colWidths=[4 * cm, 12 * cm])
+        table.setStyle(TableStyle([("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#eef6fb")), ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d0d5dd")), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"), ("LEFTPADDING", (0, 0), (-1, -1), 9), ("RIGHTPADDING", (0, 0), (-1, -1), 9)]))
+        story.extend([table, Spacer(1, 0.45 * cm)])
+    for paragraph in str(payload.get("text", "")).splitlines():
+        if paragraph.strip(): story.append(Paragraph(html.escape(paragraph.strip()), normal))
+    for url in payload.get("images", [])[:10]:
+        try:
+            response = requests.get(url, timeout=12)
+            response.raise_for_status()
+            reader = ImageReader(BytesIO(response.content))
+            width, height = reader.getSize()
+            ratio = min(16 * cm / width, 11 * cm / height, 1)
+            story.extend([Spacer(1, 0.25 * cm), Image(BytesIO(response.content), width=width * ratio, height=height * ratio)])
+        except Exception:
+            continue
+    source = str(payload.get("source", ""))
+    if source:
+        story.extend([Spacer(1, 0.35 * cm), Paragraph(f"{source_label}: {html.escape(source)}", normal)])
+    document.build(story)
+    return output.getvalue()
+
+
 def reply(start_response, status, data):
     body = json.dumps(data, ensure_ascii=False).encode()
     start_response(status, [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def pdf_reply(start_response, body):
+    start_response("200 OK", [("Content-Type", "application/pdf"), ("Content-Disposition", "attachment; filename=listing.pdf"), ("Content-Length", str(len(body)))])
     return [body]
 
 
@@ -231,10 +329,16 @@ def app(environ, start_response):
             body = (ROOT / "index.html").read_bytes()
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
             return [body]
-        if path in {"/api/extract", "/api/publish"} and method == "POST":
+        if path in {"/api/extract", "/api/publish", "/api/translate", "/api/pdf"} and method == "POST":
             length = int(environ.get("CONTENT_LENGTH") or 0)
             payload = json.loads(environ["wsgi.input"].read(length) or b"{}")
-            return reply(start_response, "200 OK", extract_listing(payload.get("url", "")) if path.endswith("extract") else {"url": publish(payload)})
+            if path.endswith("extract"):
+                return reply(start_response, "200 OK", extract_listing(payload.get("url", "")))
+            if path.endswith("translate"):
+                return reply(start_response, "200 OK", {"title": translate_to_english(str(payload.get("title", ""))), "text": translate_to_english(str(payload.get("text", "")))})
+            if path.endswith("pdf"):
+                return pdf_reply(start_response, make_pdf(payload))
+            return reply(start_response, "200 OK", {"url": publish(payload)})
         return reply(start_response, "404 Not Found", {"error": "Не знайдено"})
     except (ValueError, requests.RequestException, RuntimeError) as error:
         return reply(start_response, "400 Bad Request", {"error": str(error)})
