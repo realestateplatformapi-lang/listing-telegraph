@@ -157,7 +157,7 @@ class AppTests(unittest.TestCase):
         images = [node["attrs"]["src"] for node in content if node.get("tag") == "img"]
         self.assertEqual(images[:2], ["https://telegra.ph/file/main.jpg", "https://telegra.ph/file/logo.jpg"])
         logo_index = next(index for index, node in enumerate(content) if node.get("tag") == "img" and node["attrs"]["src"].endswith("logo.jpg"))
-        phone_index = next(index for index, node in enumerate(content) if node.get("tag") == "p" and any(isinstance(child, dict) and str(child.get("attrs", {}).get("href", "")).startswith("tel:") for child in node.get("children", [])))
+        phone_index = next(index for index, node in enumerate(content) if node.get("tag") == "p" and any(isinstance(child, dict) and child.get("children") == [app.CONTACT_PHONE] and str(child.get("attrs", {}).get("href", "")).startswith("https://") for child in node.get("children", [])))
         price_index = next(index for index, node in enumerate(content) if node.get("tag") == "h3")
         self.assertLess(logo_index, phone_index)
         self.assertLess(phone_index, price_index)

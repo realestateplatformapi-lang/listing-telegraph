@@ -666,9 +666,13 @@ def telegraph_content(payload, language, text, images=None, logo_url=None):
     if logo_url:
         content.append({"tag": "img", "attrs": {"src": logo_url}})
     if CONTACT_PHONE:
+        # Telegraph strips tel: links. Use the agency WhatsApp HTTPS address so
+        # the visible phone number remains actionable on published pages.
+        phone_digits = re.sub(r"[^0-9]", "", CONTACT_PHONE)
+        phone_url = CONTACT_LINKS.get("WhatsApp") or CONTACT_URL or f"https://wa.me/{phone_digits}"
         content.append({"tag": "p", "children": [
             {"tag": "b", "children": ["Контакти: " if language == "uk" else "Contacts: "]},
-            {"tag": "a", "attrs": {"href": "tel:" + re.sub(r"[^0-9+]", "", CONTACT_PHONE)}, "children": [CONTACT_PHONE]},
+            {"tag": "a", "attrs": {"href": phone_url}, "children": [CONTACT_PHONE]},
         ]})
     price_parts = [f"{prices.get(code)} {code}" for code in ("UAH", "USD", "EUR") if prices.get(code)]
     if price_parts:
