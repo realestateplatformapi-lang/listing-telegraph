@@ -923,7 +923,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
     original_root.mkdir(parents=True, exist_ok=True)
     final_root.mkdir(parents=True, exist_ok=True)
     processing_mode = str((payload or {}).get("processing_mode") or "ai").lower()
-    cached = existing_approved_photos(job_id, image_urls, processing_mode)
+    cached = [] if (payload or {}).get("force_ai") else existing_approved_photos(job_id, image_urls, processing_mode)
     if cached:
         return cached
     saved = []
