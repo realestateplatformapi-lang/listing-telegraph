@@ -822,6 +822,7 @@ def ai_package_photos(payload):
 
 def bridge_ai_package_photos(payload):
     """Queue an urgent GPU job for the outbound Windows worker and await its upload."""
+    init_storage()
     bridge_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
     request_payload = {
@@ -852,6 +853,7 @@ def bridge_authorized(environ):
 
 
 def bridge_reply_job(start_response):
+    init_storage()
     now = datetime.now(timezone.utc).isoformat()
     with database() as db:
         db.execute("BEGIN IMMEDIATE")
