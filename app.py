@@ -57,6 +57,8 @@ CONTACT_LINKS = {
 }
 AI_ENDPOINT = os.environ.get("KYIV_ESTATE_AI_ENDPOINT", "").strip().rstrip("/")
 AI_PACKAGES_ROOT = Path(os.environ.get("KYIV_ESTATE_AI_PACKAGES_ROOT", "")) if os.environ.get("KYIV_ESTATE_AI_PACKAGES_ROOT") else None
+AI_MODE = os.environ.get("KYIV_ESTATE_AI_MODE", "browser").strip().lower() or "browser"
+AI_TOKEN = os.environ.get("KYIV_ESTATE_AI_TOKEN", "").strip()
 SOURCE_LISTINGS_ROOT = Path(os.environ.get("KYIV_ESTATE_SOURCE_LISTINGS_ROOT", "")) if os.environ.get("KYIV_ESTATE_SOURCE_LISTINGS_ROOT") else None
 AI_REQUIRED = os.environ.get("KYIV_ESTATE_AI_REQUIRED", "false").lower() == "true"
 AI_TIMEOUT_SECONDS = max(60, int(os.environ.get("KYIV_ESTATE_AI_TIMEOUT_SECONDS", "1800")))
@@ -753,7 +755,7 @@ def ai_package_photos(payload):
     if endpoint.hostname in {"127.0.0.1", "localhost"} and endpoint.port == PORT:
         raise RuntimeError("AI endpoint не може використовувати той самий порт, що й вебзастосунок.")
     request_payload = {
-        "mode": "browser",
+        "mode": AI_MODE,
         # The Windows lane resolves known listings by our stable internal ID.
         # Source URLs remain supplemental data for browser-only submissions.
         "value": payload.get("internal_id") or payload.get("source"),
@@ -762,13 +764,14 @@ def ai_package_photos(payload):
         "description": payload.get("translations", {}).get("uk", {}).get("text", ""),
         "photo_urls": payload.get("images", []),
     }
-    response = requests.post(f"{AI_ENDPOINT}/api/v1/jobs", json=request_payload, timeout=20)
+    headers = {"X-Block3-Token": AI_TOKEN} if AI_TOKEN else {}
+    response = requests.post(f"{AI_ENDPOINT}/api/v1/jobs", json=request_payload, headers=headers, timeout=20)
     response.raise_for_status()
     job = response.json()
     deadline = time.time() + AI_TIMEOUT_SECONDS
     while time.time() < deadline:
         try:
-            status = requests.get(f"{AI_ENDPOINT}/api/v1/jobs/{job['job_id']}", timeout=20)
+            status = requests.get(f"{AI_ENDPOINT}/api/v1/jobs/{job['job_id']}", headers=headers, timeout=20)
             status.raise_for_status()
             job = status.json()
         except requests.RequestException:
@@ -786,13 +789,44 @@ def ai_package_photos(payload):
         time.sleep(3)
     else:
         raise RuntimeError("Перевищено час очікування AI-обробки фотографій.")
-    if not AI_PACKAGES_ROOT:
-        raise RuntimeError("Налаштуйте KYIV_ESTATE_AI_PACKAGES_ROOT для отримання готових фото.")
-    photos_root = AI_PACKAGES_ROOT / str(job.get("internal_id")) / "photos"
-    photos = sorted(path for path in photos_root.glob("*") if path.is_file())
+    photos = []
+    internal_id = str(job.get("internal_id") or "").strip()
+    if AI_PACKAGES_ROOT and internal_id:
+        photos_root = AI_PACKAGES_ROOT / internal_id / "photos"
+        photos = sorted(path for path in photos_root.glob("*") if path.is_file())
+    if not photos and internal_id:
+        photos = download_remote_ai_photos(internal_id, int(job.get("certified_photos") or 0), headers)
     if not photos:
         raise RuntimeError("AI-конвеєр не повернув сертифікованих фотографій.")
     return photos
+
+
+def download_remote_ai_photos(internal_id, count, headers=None):
+    """Download a certified Windows package when this app runs outside Windows."""
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(internal_id))
+    if not safe_id or count < 1 or count > MAX_PHOTOS:
+        return []
+    destination = DATA_ROOT / "remote-ai" / safe_id
+    destination.mkdir(parents=True, exist_ok=True)
+    downloaded = []
+    for index in range(1, count + 1):
+        found = None
+        for extension in ("jpg", "jpeg", "png", "webp"):
+            url = f"{AI_ENDPOINT}/packages/{quote(safe_id, safe='')}/photos/{index:02d}.{extension}"
+            response = requests.get(url, headers=headers or {}, timeout=60)
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            if not content_type.startswith("image/") or not 1024 <= len(response.content) <= 30 * 1024 * 1024:
+                raise RuntimeError("Windows AI returned an invalid certified photo.")
+            found = destination / f"{index:02d}.{extension}"
+            found.write_bytes(response.content)
+            break
+        if not found:
+            raise RuntimeError(f"Windows AI package is incomplete: photo {index:02d} is missing.")
+        downloaded.append(found)
+    return downloaded
 
 
 def existing_approved_photos(job_id, image_urls, processing_mode="ai"):

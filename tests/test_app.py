@@ -10,10 +10,11 @@ import app
 
 
 class FakeResponse:
-    def __init__(self, content=b"", payload=None, url="https://images.example/photo.jpg", content_type="image/jpeg"):
+    def __init__(self, content=b"", payload=None, url="https://images.example/photo.jpg", content_type="image/jpeg", status_code=200):
         self.content = content
         self._payload = payload
         self.url = url
+        self.status_code = status_code
         self.headers = {"Content-Type": content_type}
 
     def raise_for_status(self):
@@ -35,6 +36,8 @@ class AppTests(unittest.TestCase):
             "LOGO_URL": app.LOGO_URL,
             "AI_ENDPOINT": app.AI_ENDPOINT,
             "AI_PACKAGES_ROOT": app.AI_PACKAGES_ROOT,
+            "AI_MODE": app.AI_MODE,
+            "AI_TOKEN": app.AI_TOKEN,
             "SOURCE_LISTINGS_ROOT": app.SOURCE_LISTINGS_ROOT,
             "AI_REQUIRED": app.AI_REQUIRED,
             "MEDIA_GITHUB_REPO": app.MEDIA_GITHUB_REPO,
@@ -48,6 +51,8 @@ class AppTests(unittest.TestCase):
         app.LOGO_PATH.write_bytes(b"logo" * 1024)
         app.LOGO_URL = ""
         app.AI_ENDPOINT = ""
+        app.AI_MODE = "browser"
+        app.AI_TOKEN = ""
         app.SOURCE_LISTINGS_ROOT = None
         app.AI_REQUIRED = False
         app.MEDIA_GITHUB_REPO = ""
@@ -196,6 +201,18 @@ class AppTests(unittest.TestCase):
         result = app.ai_package_photos(self.payload())
         self.assertEqual(result, [photos / "01.jpg"])
         self.assertEqual(post.call_args.kwargs["json"]["value"], "203781")
+
+    @mock.patch.object(app.requests, "get")
+    def test_remote_ai_package_downloads_certified_photos(self, get):
+        app.AI_ENDPOINT = "https://windows-ai.example"
+        get.side_effect = [
+            FakeResponse(content=b"clean" * 1024, content_type="image/jpeg"),
+            FakeResponse(content=b"clean2" * 1024, content_type="image/jpeg"),
+        ]
+        photos = app.download_remote_ai_photos("203781", 2, {"X-Block3-Token": "secret"})
+        self.assertEqual([path.name for path in photos], ["01.jpg", "02.jpg"])
+        self.assertTrue(all(path.is_file() for path in photos))
+        self.assertEqual(get.call_args_list[0].kwargs["headers"]["X-Block3-Token"], "secret")
 
     @mock.patch.object(app, "ai_package_photos")
     @mock.patch.object(app.requests, "get")

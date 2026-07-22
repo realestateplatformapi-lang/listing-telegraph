@@ -45,6 +45,8 @@ docker run -d --restart unless-stopped -p 8080:8080 --name listing-telegraph lis
 - `KYIV_ESTATE_PHONE`, `KYIV_ESTATE_URL`, `KYIV_ESTATE_INSTAGRAM`, `KYIV_ESTATE_TELEGRAM`, `KYIV_ESTATE_WHATSAPP`, `KYIV_ESTATE_FACEBOOK`, `KYIV_ESTATE_EMAIL` — клікабельні контакти;
 - `KYIV_ESTATE_AI_ENDPOINT` — локальний endpoint наявного Windows AI-конвеєра;
 - `KYIV_ESTATE_AI_PACKAGES_ROOT` — його каталог сертифікованих пакетів на D;
+- `KYIV_ESTATE_AI_MODE=server` — режим для Railway: Windows сам знаходить оголошення за ID/посиланням;
+- `KYIV_ESTATE_AI_TOKEN` — спільний секрет для захищеного каналу Railway → Windows;
 - `KYIV_ESTATE_SOURCE_LISTINGS_ROOT` — архів оголошень Блоку 2 для відновлення оригіналів, коли вихідні CDN-посилання вже протерміновані;
 - `KYIV_ESTATE_AI_REQUIRED=true` — заборонити fallback на оригінали, якщо AI-перевірка недоступна;
 - `KYIV_ESTATE_MAX_PHOTOS` — кількість фото оголошення, від 1 до 100.
