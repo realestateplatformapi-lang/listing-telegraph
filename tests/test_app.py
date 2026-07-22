@@ -39,6 +39,7 @@ class AppTests(unittest.TestCase):
             "AI_PACKAGES_ROOT": app.AI_PACKAGES_ROOT,
             "AI_MODE": app.AI_MODE,
             "AI_TOKEN": app.AI_TOKEN,
+            "AI_BRIDGE_ENABLED": app.AI_BRIDGE_ENABLED,
             "SOURCE_LISTINGS_ROOT": app.SOURCE_LISTINGS_ROOT,
             "AI_REQUIRED": app.AI_REQUIRED,
             "MEDIA_GITHUB_REPO": app.MEDIA_GITHUB_REPO,
@@ -55,6 +56,7 @@ class AppTests(unittest.TestCase):
         app.AI_ENDPOINT = ""
         app.AI_MODE = "browser"
         app.AI_TOKEN = ""
+        app.AI_BRIDGE_ENABLED = False
         app.SOURCE_LISTINGS_ROOT = None
         app.AI_REQUIRED = False
         app.MEDIA_GITHUB_REPO = ""

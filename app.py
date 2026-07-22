@@ -2,6 +2,7 @@
 import base64
 import html
 import hashlib
+import hmac
 import ipaddress
 import json
 import mimetypes
@@ -62,6 +63,7 @@ AI_ENDPOINT = os.environ.get("KYIV_ESTATE_AI_ENDPOINT", "").strip().rstrip("/")
 AI_PACKAGES_ROOT = Path(os.environ.get("KYIV_ESTATE_AI_PACKAGES_ROOT", "")) if os.environ.get("KYIV_ESTATE_AI_PACKAGES_ROOT") else None
 AI_MODE = os.environ.get("KYIV_ESTATE_AI_MODE", "browser").strip().lower() or "browser"
 AI_TOKEN = os.environ.get("KYIV_ESTATE_AI_TOKEN", "").strip()
+AI_BRIDGE_ENABLED = os.environ.get("KYIV_ESTATE_AI_BRIDGE_ENABLED", "false").lower() == "true"
 SOURCE_LISTINGS_ROOT = Path(os.environ.get("KYIV_ESTATE_SOURCE_LISTINGS_ROOT", "")) if os.environ.get("KYIV_ESTATE_SOURCE_LISTINGS_ROOT") else None
 AI_REQUIRED = os.environ.get("KYIV_ESTATE_AI_REQUIRED", "false").lower() == "true"
 AI_TIMEOUT_SECONDS = max(60, int(os.environ.get("KYIV_ESTATE_AI_TIMEOUT_SECONDS", "1800")))
@@ -117,6 +119,12 @@ def init_storage():
                 local_path TEXT NOT NULL,
                 public_url TEXT NOT NULL,
                 uploaded_at TEXT NOT NULL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS ai_bridge_jobs (
+                id TEXT PRIMARY KEY, payload_json TEXT NOT NULL, status TEXT NOT NULL,
+                error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )
         """)
 
@@ -757,6 +765,8 @@ def publish_bilingual(payload):
 def ai_package_photos(payload):
     """Ask the existing Windows AI lane to process one listing and return certified files."""
     if not AI_ENDPOINT:
+        if AI_BRIDGE_ENABLED:
+            return bridge_ai_package_photos(payload)
         if AI_REQUIRED:
             raise RuntimeError("AI-обробка обов’язкова, але KYIV_ESTATE_AI_ENDPOINT не налаштований.")
         return []
@@ -810,6 +820,47 @@ def ai_package_photos(payload):
     return photos
 
 
+def bridge_ai_package_photos(payload):
+    """Queue an urgent GPU job for the outbound Windows worker and await its upload."""
+    bridge_id = uuid.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    request_payload = {
+        "mode": "server", "value": payload.get("internal_id") or payload.get("source"),
+        "url": payload.get("source"), "photo_urls": payload.get("images", []),
+    }
+    with database() as db:
+        db.execute("INSERT INTO ai_bridge_jobs(id,payload_json,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+                   (bridge_id, json.dumps(request_payload, ensure_ascii=False), "queued", now, now))
+    deadline = time.time() + AI_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        with database() as db:
+            row = db.execute("SELECT status,error FROM ai_bridge_jobs WHERE id=?", (bridge_id,)).fetchone()
+        if row and row[0] == "ready":
+            root = DATA_ROOT / "bridge-uploads" / bridge_id
+            photos = sorted(path for path in root.glob("*") if path.is_file())
+            if photos:
+                return photos
+            raise RuntimeError("Windows AI completed without certified photos.")
+        if row and row[0] == "failed":
+            raise RuntimeError("Windows AI processing failed: " + str(row[1] or "unknown error"))
+        time.sleep(2)
+    raise RuntimeError("Windows AI processing timed out.")
+
+
+def bridge_authorized(environ):
+    return bool(AI_TOKEN and hmac.compare_digest(environ.get("HTTP_X_BLOCK3_TOKEN", ""), AI_TOKEN))
+
+
+def bridge_reply_job(start_response):
+    now = datetime.now(timezone.utc).isoformat()
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT id,payload_json FROM ai_bridge_jobs WHERE status='queued' ORDER BY created_at LIMIT 1").fetchone()
+        if row:
+            db.execute("UPDATE ai_bridge_jobs SET status='claimed',updated_at=? WHERE id=?", (now, row[0]))
+    return reply(start_response, "200 OK", {"job_id": row[0], "payload": json.loads(row[1])} if row else {"job_id": None})
+
+
 def download_remote_ai_photos(internal_id, count, headers=None):
     """Download a certified Windows package when this app runs outside Windows."""
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(internal_id))
@@ -847,7 +898,7 @@ def existing_approved_photos(job_id, image_urls, processing_mode="ai"):
         return []
     if record.get("processing_mode", "ai") != processing_mode:
         return []
-    if processing_mode == "ai" and AI_ENDPOINT and record.get("ai_processing", {}).get("result") != "ai_clean":
+    if processing_mode == "ai" and (AI_ENDPOINT or AI_BRIDGE_ENABLED) and record.get("ai_processing", {}).get("result") != "ai_clean":
         return []
     result = []
     for item in record.get("photos", []):
@@ -902,7 +953,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
             })
         except requests.RequestException:
             continue
-    if payload and processing_mode == "ai" and AI_ENDPOINT:
+    if payload and processing_mode == "ai" and (AI_ENDPOINT or AI_BRIDGE_ENABLED):
         processed = ai_package_photos(payload)
         if not saved and SOURCE_LISTINGS_ROOT and SOURCE_LISTINGS_ROOT.is_dir():
             candidates = []
@@ -1014,7 +1065,7 @@ def create_package(payload):
         "selected_source_urls": list(payload.get("images", [])[:MAX_PHOTOS]),
         "processing_mode": str(payload.get("processing_mode") or "ai").lower(),
         "ai_processing": {
-            "enabled": bool(AI_ENDPOINT) and str(payload.get("processing_mode") or "ai").lower() == "ai",
+            "enabled": bool(AI_ENDPOINT or AI_BRIDGE_ENABLED) and str(payload.get("processing_mode") or "ai").lower() == "ai",
             "required": AI_REQUIRED and str(payload.get("processing_mode") or "ai").lower() == "ai",
             "result": "ai_clean" if any(item.get("ai_processed") for item in approved) else "original_verified",
         },
@@ -1156,6 +1207,34 @@ def app(environ, start_response):
             body = (ROOT / "index.html").read_bytes()
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
             return [body]
+        if path == "/api/bridge/jobs/next" and method == "GET":
+            if not bridge_authorized(environ):
+                return reply(start_response, "401 Unauthorized", {"error": "unauthorized"})
+            return bridge_reply_job(start_response)
+        bridge_photo = re.fullmatch(r"/api/bridge/jobs/([a-f0-9]{32})/photos/(\d{2})\.(jpg|jpeg|png|webp)", path)
+        if bridge_photo and method == "POST":
+            if not bridge_authorized(environ):
+                return reply(start_response, "401 Unauthorized", {"error": "unauthorized"})
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+            if length < 1024 or length > 30 * 1024 * 1024:
+                return reply(start_response, "413 Payload Too Large", {"error": "invalid image size"})
+            root = DATA_ROOT / "bridge-uploads" / bridge_photo.group(1)
+            root.mkdir(parents=True, exist_ok=True)
+            destination = root / f"{bridge_photo.group(2)}.{bridge_photo.group(3)}"
+            destination.write_bytes(environ["wsgi.input"].read(length))
+            return reply(start_response, "200 OK", {"ok": True})
+        bridge_finish = re.fullmatch(r"/api/bridge/jobs/([a-f0-9]{32})/(complete|fail)", path)
+        if bridge_finish and method == "POST":
+            if not bridge_authorized(environ):
+                return reply(start_response, "401 Unauthorized", {"error": "unauthorized"})
+            length = int(environ.get("CONTENT_LENGTH") or 0)
+            payload = json.loads(environ["wsgi.input"].read(length) or b"{}") if 0 <= length <= 100_000 else {}
+            status = "ready" if bridge_finish.group(2) == "complete" else "failed"
+            now = datetime.now(timezone.utc).isoformat()
+            with database() as db:
+                db.execute("UPDATE ai_bridge_jobs SET status=?,error=?,updated_at=? WHERE id=?",
+                           (status, str(payload.get("error") or "")[:2000] or None, now, bridge_finish.group(1)))
+            return reply(start_response, "200 OK", {"ok": True, "status": status})
         if path.startswith("/packages/") and method == "GET":
             requested = (PACKAGES_ROOT / path.removeprefix("/packages/")).resolve()
             if PACKAGES_ROOT.resolve() not in requested.parents or not requested.is_file():
