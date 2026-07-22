@@ -113,7 +113,10 @@ class AppTests(unittest.TestCase):
     @mock.patch.object(app.requests, "get")
     def test_package_persists_original_final_logo_and_manifest(self, get, _safe):
         get.return_value = FakeResponse(content=b"image" * 1024)
-        result = app.create_package(self.payload())
+        payload = self.payload()
+        payload["processing_mode"] = "ai"
+        payload["media_choices"] = None
+        result = app.create_package(payload)
         package = app.PACKAGES_ROOT / "203781"
         manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
         html = (package / "uk.html").read_text(encoding="utf-8")

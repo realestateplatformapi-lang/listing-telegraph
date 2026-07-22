@@ -1059,7 +1059,7 @@ def create_package(payload):
         for stale_file in media_root.iterdir():
             if stale_file.is_file():
                 stale_file.unlink()
-    media_choices = {int(item.get("order")): item.get("kind") for item in payload.get("media_choices", []) if str(item.get("order", "")).isdigit()}
+    media_choices = {int(item.get("order")): item.get("kind") for item in (payload.get("media_choices") or []) if str(item.get("order", "")).isdigit()}
     for item in approved:
         choice = media_choices.get(int(item["order"]), "processed")
         selected_path = item.get("original_path") if choice == "original" and item.get("original_path") else item["final_path"]
