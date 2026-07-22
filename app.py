@@ -1,4 +1,5 @@
 """KYIV ESTATE: turn a listing into bilingual Telegraph-ready pages."""
+import base64
 import html
 import hashlib
 import ipaddress
@@ -9,6 +10,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -17,7 +19,7 @@ from io import BytesIO
 from html.parser import HTMLParser
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 from wsgiref.simple_server import WSGIServer, make_server
 
 import truststore
@@ -38,6 +40,10 @@ DB_PATH = DATA_ROOT / "block3.sqlite3"
 ALLOWED_ROOT_DOMAINS = ("olx.ua", "rieltor.ua")
 TELEGRAPH_API = "https://api.telegra.ph"
 ACCESS_TOKEN = os.environ.get("TELEGRAPH_ACCESS_TOKEN")
+MEDIA_GITHUB_REPO = os.environ.get("KYIV_ESTATE_MEDIA_GITHUB_REPO", "").strip()
+MEDIA_GITHUB_BRANCH = os.environ.get("KYIV_ESTATE_MEDIA_GITHUB_BRANCH", "media").strip() or "media"
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+MEDIA_UPLOAD_LOCK = threading.Lock()
 LOGO_URL = os.environ.get("KYIV_ESTATE_LOGO_URL", "").strip()
 LOGO_PATH = Path(os.environ.get("KYIV_ESTATE_LOGO_PATH", "")).expanduser() if os.environ.get("KYIV_ESTATE_LOGO_PATH") else None
 CONTACT_PHONE = os.environ.get("KYIV_ESTATE_PHONE", "").strip()
@@ -501,6 +507,101 @@ def telegraph_image(path):
     return public_url
 
 
+def github_api(method, path, **kwargs):
+    """Call the repository API without ever placing the token in a public URL."""
+    if not MEDIA_GITHUB_REPO or not GITHUB_TOKEN:
+        raise RuntimeError("GitHub media storage is not configured.")
+    headers = dict(kwargs.pop("headers", {}))
+    headers.update({
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "KYIV-ESTATE/1.0",
+    })
+    return requests.request(method, f"https://api.github.com/repos/{MEDIA_GITHUB_REPO}{path}", headers=headers, timeout=90, **kwargs)
+
+
+def ensure_media_branch():
+    branch_path = quote(MEDIA_GITHUB_BRANCH, safe="")
+    response = github_api("GET", f"/git/ref/heads/{branch_path}")
+    if response.status_code == 200:
+        return response.json()["object"]["sha"]
+    if response.status_code != 404:
+        response.raise_for_status()
+    repository = github_api("GET", "")
+    repository.raise_for_status()
+    default_branch = repository.json()["default_branch"]
+    base = github_api("GET", f"/git/ref/heads/{quote(default_branch, safe='')}")
+    base.raise_for_status()
+    base_sha = base.json()["object"]["sha"]
+    created = github_api("POST", "/git/refs", json={"ref": f"refs/heads/{MEDIA_GITHUB_BRANCH}", "sha": base_sha})
+    if created.status_code not in (201, 422):
+        created.raise_for_status()
+    if created.status_code == 422:
+        existing = github_api("GET", f"/git/ref/heads/{branch_path}")
+        existing.raise_for_status()
+        return existing.json()["object"]["sha"]
+    return created.json()["object"]["sha"]
+
+
+def github_media_images(paths, folder):
+    """Commit one listing's missing media atomically and return stable raw URLs."""
+    paths = [Path(path) for path in paths]
+    head_sha = ensure_media_branch()
+    commit = github_api("GET", f"/git/commits/{head_sha}")
+    commit.raise_for_status()
+    safe_folder = re.sub(r"[^a-zA-Z0-9_-]", "", str(folder)) or "listing"
+    entries, repo_paths = [], []
+    for path in paths:
+        digest = file_sha256(path)
+        suffix = path.suffix.lower() if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+        repo_path = f"media/{safe_folder}/{digest[:20]}{suffix}"
+        blob = github_api("POST", "/git/blobs", json={"content": base64.b64encode(path.read_bytes()).decode("ascii"), "encoding": "base64"})
+        blob.raise_for_status()
+        entries.append({"path": repo_path, "mode": "100644", "type": "blob", "sha": blob.json()["sha"]})
+        repo_paths.append(repo_path)
+    tree = github_api("POST", "/git/trees", json={"base_tree": commit.json()["tree"]["sha"], "tree": entries})
+    tree.raise_for_status()
+    new_commit = github_api("POST", "/git/commits", json={"message": f"Add media for listing {safe_folder}", "tree": tree.json()["sha"], "parents": [head_sha]})
+    new_commit.raise_for_status()
+    updated = github_api("PATCH", f"/git/refs/heads/{quote(MEDIA_GITHUB_BRANCH, safe='')}", json={"sha": new_commit.json()["sha"], "force": False})
+    updated.raise_for_status()
+    repo = "/".join(quote(part, safe="") for part in MEDIA_GITHUB_REPO.split("/"))
+    branch = quote(MEDIA_GITHUB_BRANCH, safe="")
+    return [f"https://raw.githubusercontent.com/{repo}/{branch}/" + "/".join(quote(part, safe="") for part in repo_path.split("/")) for repo_path in repo_paths]
+
+
+def durable_image_urls(paths, folder):
+    """Reuse uploaded assets and batch-publish only missing files."""
+    paths = [Path(path) for path in paths]
+    init_storage()
+    cached_urls, missing = {}, []
+    with database() as db:
+        for path in paths:
+            digest = file_sha256(path)
+            row = db.execute("SELECT public_url FROM uploaded_assets WHERE sha256=?", (digest,)).fetchone()
+            if row:
+                cached_urls[digest] = row[0]
+            else:
+                missing.append(path)
+    if missing:
+        if MEDIA_GITHUB_REPO and GITHUB_TOKEN:
+            with MEDIA_UPLOAD_LOCK:
+                uploaded = github_media_images(missing, folder)
+        else:
+            uploaded = [telegraph_image(path) for path in missing]
+        now = datetime.now(timezone.utc).isoformat()
+        with database() as db:
+            for path, public_url in zip(missing, uploaded):
+                digest = file_sha256(path)
+                cached_urls[digest] = public_url
+                db.execute(
+                    "INSERT OR REPLACE INTO uploaded_assets (sha256,local_path,public_url,uploaded_at) VALUES (?,?,?,?)",
+                    (digest, str(path), public_url, now),
+                )
+    return [cached_urls[file_sha256(path)] for path in paths]
+
+
 def token():
     global ACCESS_TOKEN
     if ACCESS_TOKEN:
@@ -615,8 +716,8 @@ def publish_bilingual(payload):
     local_images = [package_root / "photos" / item["filename"] for item in manifest["photos"]]
     if not local_images:
         raise ValueError("Немає перевірених фотографій для Telegraph.")
-    image_urls = [telegraph_image(path) for path in local_images]
-    logo_url = telegraph_image(ensure_local_logo())
+    media_urls = durable_image_urls([*local_images, ensure_local_logo()], job_id)
+    image_urls, logo_url = media_urls[:-1], media_urls[-1]
     uk_title = f"{job_id} · {uk['title']}"
     en_title = f"{job_id} · {en['title']}"
     uk_content = telegraph_content(payload, "uk", str(uk["text"]), image_urls, logo_url)
@@ -947,24 +1048,36 @@ def make_pdf(payload):
         local_root = PACKAGES_ROOT / job_id / "photos"
         if local_root.is_dir():
             local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:10]
-    for local_path in local_photos:
+    def append_pdf_image(source):
+        if isinstance(source, (bytes, bytearray)):
+            reader_source, image_source = BytesIO(source), BytesIO(source)
+        else:
+            reader_source = image_source = str(source)
+        reader = ImageReader(reader_source)
+        width, height = reader.getSize()
+        ratio = min(16 * cm / width, 11 * cm / height, 1)
+        story.extend([Spacer(1, 0.25 * cm), Image(image_source, width=width * ratio, height=height * ratio)])
+
+    added_photos = 0
+    if local_photos:
+        photo_sources = local_photos
+    else:
+        photo_sources = []
+        for url in payload.get("images", [])[:10]:
+            if not safe_remote_url(url):
+                continue
+            try:
+                response = requests.get(url, timeout=12)
+                response.raise_for_status()
+                photo_sources.append(response.content)
+            except Exception:
+                continue
+    for source in photo_sources:
         try:
-            reader = ImageReader(str(local_path))
-            width, height = reader.getSize()
-            ratio = min(16 * cm / width, 11 * cm / height, 1)
-            story.extend([Spacer(1, 0.25 * cm), Image(str(local_path), width=width * ratio, height=height * ratio)])
-        except Exception:
-            continue
-    for url in ([] if local_photos else payload.get("images", [])[:10]):
-        if not safe_remote_url(url):
-            continue
-        try:
-            response = requests.get(url, timeout=12)
-            response.raise_for_status()
-            reader = ImageReader(BytesIO(response.content))
-            width, height = reader.getSize()
-            ratio = min(16 * cm / width, 11 * cm / height, 1)
-            story.extend([Spacer(1, 0.25 * cm), Image(BytesIO(response.content), width=width * ratio, height=height * ratio)])
+            append_pdf_image(source)
+            added_photos += 1
+            if added_photos == 1:
+                append_pdf_image(ensure_local_logo())
         except Exception:
             continue
     contacts = " · ".join(part for part in (CONTACT_PHONE, CONTACT_URL) if part)

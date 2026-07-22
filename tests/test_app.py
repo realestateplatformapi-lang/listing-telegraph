@@ -1,4 +1,5 @@
 import json
+import base64
 import tempfile
 import unittest
 from io import BytesIO
@@ -36,6 +37,9 @@ class AppTests(unittest.TestCase):
             "AI_PACKAGES_ROOT": app.AI_PACKAGES_ROOT,
             "SOURCE_LISTINGS_ROOT": app.SOURCE_LISTINGS_ROOT,
             "AI_REQUIRED": app.AI_REQUIRED,
+            "MEDIA_GITHUB_REPO": app.MEDIA_GITHUB_REPO,
+            "MEDIA_GITHUB_BRANCH": app.MEDIA_GITHUB_BRANCH,
+            "GITHUB_TOKEN": app.GITHUB_TOKEN,
         }
         app.DATA_ROOT = root / "data"
         app.PACKAGES_ROOT = app.DATA_ROOT / "packages"
@@ -46,6 +50,9 @@ class AppTests(unittest.TestCase):
         app.AI_ENDPOINT = ""
         app.SOURCE_LISTINGS_ROOT = None
         app.AI_REQUIRED = False
+        app.MEDIA_GITHUB_REPO = ""
+        app.MEDIA_GITHUB_BRANCH = "media"
+        app.GITHUB_TOKEN = ""
         app.init_storage()
 
     def tearDown(self):
@@ -114,6 +121,19 @@ class AppTests(unittest.TestCase):
         )
         images = [node["attrs"]["src"] for node in content if node.get("tag") == "img"]
         self.assertEqual(images[:2], ["https://telegra.ph/file/main.jpg", "https://telegra.ph/file/logo.jpg"])
+
+    @mock.patch.object(app, "github_media_images")
+    def test_durable_media_preserves_photo_and_logo_order(self, upload):
+        app.MEDIA_GITHUB_REPO = "realestateplatformapi-lang/listing-telegraph"
+        app.GITHUB_TOKEN = "secret"
+        photo = app.DATA_ROOT / "photo.jpg"
+        logo = app.DATA_ROOT / "logo.jpg"
+        photo.parent.mkdir(parents=True, exist_ok=True)
+        photo.write_bytes(b"photo" * 1024)
+        logo.write_bytes(b"logo" * 1024)
+        upload.return_value = ["https://raw.example/photo.jpg", "https://raw.example/logo.jpg"]
+        self.assertEqual(app.durable_image_urls([photo, logo], "203781"), upload.return_value)
+        upload.assert_called_once_with([photo, logo], "203781")
 
     @mock.patch.object(app.requests, "post")
     def test_telegraph_upload_is_cached_by_hash(self, post):
@@ -221,6 +241,24 @@ class AppTests(unittest.TestCase):
         page = b"".join(app.app({"PATH_INFO": "/", "REQUEST_METHOD": "GET", "wsgi.input": BytesIO()}, start_response))
         self.assertEqual(captured["status"], "200 OK")
         self.assertIn(b"KYIV ESTATE", page)
+        self.assertNotIn(b"Fast import with source photos", page)
+        self.assertNotIn(b"Removes people, agency images and watermarks", page)
+
+    def test_pdf_places_logo_after_first_property_photo(self):
+        pixel = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+        photo_root = app.PACKAGES_ROOT / "203781" / "photos"
+        photo_root.mkdir(parents=True)
+        first, second = photo_root / "01.png", photo_root / "02.png"
+        first.write_bytes(pixel)
+        second.write_bytes(pixel)
+        app.LOGO_PATH.write_bytes(pixel)
+        payload = self.payload()
+        payload.update({"processing_mode": "ai", "language": "en", "title": "Apartment", "text": "Description"})
+        with mock.patch("reportlab.platypus.SimpleDocTemplate") as document, mock.patch("reportlab.platypus.Image") as image:
+            document.return_value.build.return_value = None
+            app.make_pdf(payload)
+        sources = [str(call.args[0]) for call in image.call_args_list]
+        self.assertEqual(sources[:3], [str(first), str(app.DATA_ROOT / "assets" / "kyiv-estate-logo.jpg"), str(second)])
 
 
 if __name__ == "__main__":

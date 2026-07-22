@@ -21,6 +21,15 @@ $env:KYIV_ESTATE_WHATSAPP = $KyivEstateWhatsApp
 $env:KYIV_ESTATE_FACEBOOK = $KyivEstateFacebook
 $env:KYIV_ESTATE_EMAIL = $KyivEstateEmail
 $env:TELEGRAPH_ACCESS_TOKEN = $TelegraphAccessToken
+$env:KYIV_ESTATE_MEDIA_GITHUB_REPO = $MediaGitHubRepo
+$env:KYIV_ESTATE_MEDIA_GITHUB_BRANCH = $MediaGitHubBranch
+if ($MediaGitHubRepo) {
+    $GhCommand = Get-Command gh.exe -ErrorAction SilentlyContinue
+    $GhPath = if ($GhCommand) { $GhCommand.Source } elseif (Test-Path "C:\Program Files\GitHub CLI\gh.exe") { "C:\Program Files\GitHub CLI\gh.exe" } else { "" }
+    if (-not $GhPath) { throw "GitHub CLI is required for durable Telegraph images." }
+    $env:GITHUB_TOKEN = (& $GhPath auth token).Trim()
+    if (-not $env:GITHUB_TOKEN) { throw "Run 'gh auth login' before starting KYIV ESTATE." }
+}
 $env:KYIV_ESTATE_AI_ENDPOINT = $AiEndpoint
 $env:KYIV_ESTATE_AI_PACKAGES_ROOT = $AiPackagesRoot
 $env:KYIV_ESTATE_SOURCE_LISTINGS_ROOT = $SourceListingsRoot

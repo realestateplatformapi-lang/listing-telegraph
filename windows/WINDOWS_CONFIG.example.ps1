@@ -20,6 +20,8 @@ $KyivEstateWhatsApp = ""
 $KyivEstateFacebook = ""
 $KyivEstateEmail = ""
 $TelegraphAccessToken = ""
+$MediaGitHubRepo = "realestateplatformapi-lang/listing-telegraph"
+$MediaGitHubBranch = "media"
 
 # Existing Windows AI photo lane (Block 3 / Block 2). It remains isolated on 8793.
 $AiEndpoint = "http://127.0.0.1:8793"
