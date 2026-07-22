@@ -34,6 +34,7 @@ class AppTests(unittest.TestCase):
             "DB_PATH": app.DB_PATH,
             "LOGO_PATH": app.LOGO_PATH,
             "LOGO_URL": app.LOGO_URL,
+            "PUBLIC_BASE_URL": app.PUBLIC_BASE_URL,
             "AI_ENDPOINT": app.AI_ENDPOINT,
             "AI_PACKAGES_ROOT": app.AI_PACKAGES_ROOT,
             "AI_MODE": app.AI_MODE,
@@ -50,6 +51,7 @@ class AppTests(unittest.TestCase):
         app.LOGO_PATH = root / "logo.jpg"
         app.LOGO_PATH.write_bytes(b"logo" * 1024)
         app.LOGO_URL = ""
+        app.PUBLIC_BASE_URL = ""
         app.AI_ENDPOINT = ""
         app.AI_MODE = "browser"
         app.AI_TOKEN = ""

@@ -46,6 +46,9 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 MEDIA_UPLOAD_LOCK = threading.Lock()
 LOGO_URL = os.environ.get("KYIV_ESTATE_LOGO_URL", "").strip()
 LOGO_PATH = Path(os.environ.get("KYIV_ESTATE_LOGO_PATH", str(ROOT / "assets" / "kyiv-estate-logo.jpg"))).expanduser()
+PUBLIC_BASE_URL = os.environ.get("KYIV_ESTATE_PUBLIC_BASE_URL", "").strip().rstrip("/")
+if not PUBLIC_BASE_URL and os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
+    PUBLIC_BASE_URL = "https://" + os.environ["RAILWAY_PUBLIC_DOMAIN"].strip().strip("/")
 CONTACT_PHONE = os.environ.get("KYIV_ESTATE_PHONE", "").strip()
 CONTACT_URL = os.environ.get("KYIV_ESTATE_URL", "").strip()
 CONTACT_LINKS = {
@@ -718,8 +721,14 @@ def publish_bilingual(payload):
     local_images = [package_root / "photos" / item["filename"] for item in manifest["photos"]]
     if not local_images:
         raise ValueError("Немає перевірених фотографій для Telegraph.")
-    media_urls = durable_image_urls([*local_images, ensure_local_logo()], job_id)
-    image_urls, logo_url = media_urls[:-1], media_urls[-1]
+    package_logo = package_root / "assets" / "kyiv-estate-logo.jpg"
+    if PUBLIC_BASE_URL:
+        package_id = quote(package["internal_id"], safe="")
+        image_urls = [f"{PUBLIC_BASE_URL}/packages/{package_id}/photos/{quote(path.name, safe='')}" for path in local_images]
+        logo_url = f"{PUBLIC_BASE_URL}/packages/{package_id}/assets/kyiv-estate-logo.jpg"
+    else:
+        media_urls = durable_image_urls([*local_images, package_logo], job_id)
+        image_urls, logo_url = media_urls[:-1], media_urls[-1]
     uk_title = f"{job_id} · {uk['title']}"
     en_title = f"{job_id} · {en['title']}"
     uk_content = telegraph_content(payload, "uk", str(uk["text"]), image_urls, logo_url)
