@@ -28,6 +28,7 @@ import truststore
 truststore.inject_into_ssl()
 
 import requests
+from bs4 import BeautifulSoup
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("PORT", "8080"))
@@ -249,6 +250,23 @@ def flatten_jsonld(value):
             yield from flatten_jsonld(value["@graph"])
 
 
+def listing_photo_urls(images, page_url):
+    """Keep listing media and reject site chrome, avatars, icons and payment art."""
+    page_host = (urlparse(page_url).hostname or "").lower()
+    accepted = []
+    for image in images:
+        parsed = urlparse(image)
+        host, path = (parsed.hostname or "").lower(), parsed.path.lower()
+        keep = True
+        if page_host.endswith("rieltor.ua"):
+            keep = host == "market-images.lunstatic.net" and "/images/offers/" in path and "/310/310/" not in path
+        elif page_host.endswith("olx.ua"):
+            keep = host.endswith("apollo.olxcdn.com") and "/v1/files/" in path
+        if keep and image not in accepted:
+            accepted.append(image)
+    return accepted
+
+
 def extract_listing(source_url):
     source_url = normalize_listing_input(source_url)
     reject_unsafe_url(source_url)
@@ -290,8 +308,9 @@ def extract_listing(source_url):
     # Rieltor's OG description is only a short price/area summary; its full text
     # is in .offer-view-section-text and is stored first by ListingParser.
     page_text = "\n\n".join(parser.text_blocks[:12])
-    if (urlparse(response.url).hostname or "").endswith("rieltor.ua") and parser.text_blocks:
-        description = page_text
+    if (urlparse(response.url).hostname or "").endswith("rieltor.ua"):
+        description_node = BeautifulSoup(response.text, "html.parser").select_one(".offer-view-section-text")
+        description = description_node.get_text("\n", strip=True) if description_node else page_text
     else:
         description = description or page_text
     images = parser.meta.get("og:image", []) + parser.meta.get("twitter:image", []) + parser.images
@@ -317,10 +336,12 @@ def extract_listing(source_url):
     detail_text = " ".join(parser.meta.get("og:description", [])) + " " + page_plain
     details = extract_details(detail_text)
     prices = convert_prices(details.get("price"), details.get("currency"))
+    clean_images = listing_photo_urls(clean_images, response.url)
     listing = {
         "internal_id": job_id,
         "title": clean_title,
         "description": clean_description,
+        "original_description": html.unescape(description).strip(),
         "images": clean_images[:MAX_PHOTOS],
         "source": response.url,
         "details": details,
@@ -345,6 +366,7 @@ def extract_details(page_text):
 
 
 def sanitize_title(value):
+    value = re.sub(r"(?:Ресурс|Resource)\s*\d+.*$", "", value, flags=re.IGNORECASE)
     value = re.sub(r"\s*[-|·]\s*(?:RIELTOR\.UA|OLX(?:\.UA)?)\s*$", "", value, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", value).strip(" \"'—-")
 
@@ -654,6 +676,11 @@ def ai_package_photos(payload):
         if job.get("status") in {"ready", "published"}:
             break
         if job.get("status") == "failed":
+            if AI_PACKAGES_ROOT and job.get("internal_id"):
+                fallback_root = AI_PACKAGES_ROOT / str(job["internal_id"]) / "photos"
+                fallback = sorted(path for path in fallback_root.glob("*") if path.is_file())
+                if fallback:
+                    return fallback
             raise RuntimeError("AI-обробка фото зупинилася: " + str(job.get("error") or "невідома помилка"))
         time.sleep(3)
     else:
@@ -667,14 +694,16 @@ def ai_package_photos(payload):
     return photos
 
 
-def existing_approved_photos(job_id, image_urls):
+def existing_approved_photos(job_id, image_urls, processing_mode="ai"):
     manifest = PACKAGES_ROOT / job_id / "manifest.json"
     if not manifest.is_file():
         return []
     record = json.loads(manifest.read_text(encoding="utf-8"))
     if record.get("selected_source_urls") != list(image_urls[:MAX_PHOTOS]):
         return []
-    if AI_ENDPOINT and record.get("ai_processing", {}).get("result") != "ai_clean":
+    if record.get("processing_mode", "ai") != processing_mode:
+        return []
+    if processing_mode == "ai" and AI_ENDPOINT and record.get("ai_processing", {}).get("result") != "ai_clean":
         return []
     result = []
     for item in record.get("photos", []):
@@ -694,7 +723,8 @@ def save_approved_photos(job_id, image_urls, payload=None):
     final_root = listing_root / "final"
     original_root.mkdir(parents=True, exist_ok=True)
     final_root.mkdir(parents=True, exist_ok=True)
-    cached = existing_approved_photos(job_id, image_urls)
+    processing_mode = str((payload or {}).get("processing_mode") or "ai").lower()
+    cached = existing_approved_photos(job_id, image_urls, processing_mode)
     if cached:
         return cached
     saved = []
@@ -728,7 +758,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
             })
         except requests.RequestException:
             continue
-    if payload and AI_ENDPOINT:
+    if payload and processing_mode == "ai" and AI_ENDPOINT:
         processed = ai_package_photos(payload)
         if not saved and SOURCE_LISTINGS_ROOT and SOURCE_LISTINGS_ROOT.is_dir():
             candidates = []
@@ -767,7 +797,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
                 "sha256": file_sha256(final_path),
             })
         saved = ai_saved
-    elif payload and AI_REQUIRED:
+    elif payload and processing_mode == "ai" and AI_REQUIRED:
         raise RuntimeError("AI-обробка обов’язкова, але локальний AI endpoint недоступний.")
     return saved
 
@@ -800,14 +830,26 @@ def create_package(payload):
     existing_manifest = package_root / "manifest.json"
     previous_record = json.loads(existing_manifest.read_text(encoding="utf-8")) if existing_manifest.is_file() else {}
     photos_root = package_root / "photos"
+    originals_root = package_root / "originals"
     assets_root = package_root / "assets"
     photos_root.mkdir(parents=True, exist_ok=True)
+    originals_root.mkdir(parents=True, exist_ok=True)
     assets_root.mkdir(parents=True, exist_ok=True)
     approved = save_approved_photos(job_id, payload.get("images", []), payload)
+    requested_choices = payload.get("media_choices", [])
+    if requested_choices:
+        included_orders = {int(item["order"]) for item in requested_choices if str(item.get("order", "")).isdigit()}
+        approved = [item for item in approved if int(item["order"]) in included_orders]
     if not approved:
         raise ValueError("Жодну фотографію не вдалося зберегти й перевірити.")
+    media_choices = {int(item.get("order")): item.get("kind") for item in payload.get("media_choices", []) if str(item.get("order", "")).isdigit()}
     for item in approved:
-        shutil.copy2(item["final_path"], photos_root / item["filename"])
+        choice = media_choices.get(int(item["order"]), "processed")
+        selected_path = item.get("original_path") if choice == "original" and item.get("original_path") else item["final_path"]
+        shutil.copy2(selected_path, photos_root / item["filename"])
+        if item.get("original_path"):
+            shutil.copy2(item["original_path"], originals_root / item["filename"])
+        item["package_choice"] = "original" if selected_path == item.get("original_path") else "processed"
     shutil.copy2(ensure_local_logo(), assets_root / "kyiv-estate-logo.jpg")
     manifest_photos = []
     for item in approved:
@@ -825,9 +867,10 @@ def create_package(payload):
         "prices": payload.get("prices", {}),
         "photos": manifest_photos,
         "selected_source_urls": list(payload.get("images", [])[:MAX_PHOTOS]),
+        "processing_mode": str(payload.get("processing_mode") or "ai").lower(),
         "ai_processing": {
-            "enabled": bool(AI_ENDPOINT),
-            "required": AI_REQUIRED,
+            "enabled": bool(AI_ENDPOINT) and str(payload.get("processing_mode") or "ai").lower() == "ai",
+            "required": AI_REQUIRED and str(payload.get("processing_mode") or "ai").lower() == "ai",
             "result": "ai_clean" if any(item.get("ai_processed") for item in approved) else "original_verified",
         },
         "languages": ["uk", "en"],
@@ -840,7 +883,15 @@ def create_package(payload):
     (package_root / "en.html").write_text(render_package_page("en", record, approved), encoding="utf-8")
     (package_root / "index.html").write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=uk.html">', encoding="utf-8")
     update_job(job_id, str(payload.get("source", "")), "ready", 100, snapshot=record, package_path=str(package_root))
-    return {"internal_id": job_id, "uk": f"/packages/{job_id}/uk.html", "en": f"/packages/{job_id}/en.html", "manifest": f"/packages/{job_id}/manifest.json", "photo_count": len(approved)}
+    return {
+        "internal_id": job_id,
+        "uk": f"/packages/{job_id}/uk.html",
+        "en": f"/packages/{job_id}/en.html",
+        "manifest": f"/packages/{job_id}/manifest.json",
+        "photo_count": len(approved),
+        "processed": [f"/packages/{job_id}/photos/{item['filename']}" for item in approved],
+        "originals": [f"/packages/{job_id}/originals/{item['filename']}" if item.get("original_path") else "" for item in approved],
+    }
 
 
 def make_pdf(payload):
@@ -890,7 +941,21 @@ def make_pdf(payload):
         story.extend([table, Spacer(1, 0.45 * cm)])
     for paragraph in str(payload.get("text", "")).splitlines():
         if paragraph.strip(): story.append(Paragraph(html.escape(paragraph.strip()), normal))
-    for url in payload.get("images", [])[:10]:
+    local_photos = []
+    if str(payload.get("processing_mode") or "browser").lower() == "ai":
+        job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("internal_id", "")))
+        local_root = PACKAGES_ROOT / job_id / "photos"
+        if local_root.is_dir():
+            local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:10]
+    for local_path in local_photos:
+        try:
+            reader = ImageReader(str(local_path))
+            width, height = reader.getSize()
+            ratio = min(16 * cm / width, 11 * cm / height, 1)
+            story.extend([Spacer(1, 0.25 * cm), Image(str(local_path), width=width * ratio, height=height * ratio)])
+        except Exception:
+            continue
+    for url in ([] if local_photos else payload.get("images", [])[:10]):
         if not safe_remote_url(url):
             continue
         try:

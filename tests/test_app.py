@@ -70,6 +70,25 @@ class AppTests(unittest.TestCase):
         text = "Світла квартира. Телефонуйте рієлтору. Комісія 3%."
         self.assertEqual(app.sanitize_public_text(text), "Світла квартира.")
 
+    def test_rieltor_gallery_rejects_icons_avatars_and_site_art(self):
+        images = [
+            "https://rieltor.ua/img/menu/icon_menu_flats.svg",
+            "https://rieltor-images.lunstatic.net/rieltor-ua-01/120/120/avatars/1.jpg",
+            "https://market-images.lunstatic.net/lun-ua/310/310/images/offers/preview.jpg",
+            "https://market-images.lunstatic.net/lun-ua/t.1.0.0/1600/1200/images/offers/room.jpg",
+            "https://rieltor.ua/img/mastercard.svg",
+        ]
+        self.assertEqual(
+            app.listing_photo_urls(images, "https://rieltor.ua/flats-rent/view/12883087/"),
+            [images[3]],
+        )
+
+    def test_title_rejects_rieltor_resource_tail(self):
+        self.assertEqual(
+            app.sanitize_title("Apartment - RIELTOR.UAResource 1Resource 1"),
+            "Apartment",
+        )
+
     @mock.patch.object(app, "safe_remote_url", return_value=True)
     @mock.patch.object(app.requests, "get")
     def test_package_persists_original_final_logo_and_manifest(self, get, _safe):
@@ -79,6 +98,8 @@ class AppTests(unittest.TestCase):
         manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
         html = (package / "uk.html").read_text(encoding="utf-8")
         self.assertEqual(result["photo_count"], 1)
+        self.assertEqual(result["processed"], ["/packages/203781/photos/01.jpg"])
+        self.assertEqual(result["originals"], ["/packages/203781/originals/01.jpg"])
         self.assertTrue((app.DATA_ROOT / "listings/203781/original/01.jpg").is_file())
         self.assertTrue((app.DATA_ROOT / "listings/203781/final/01.jpg").is_file())
         self.assertTrue((package / "assets/kyiv-estate-logo.jpg").is_file())
@@ -172,6 +193,19 @@ class AppTests(unittest.TestCase):
         app.AI_PACKAGES_ROOT = ai_root
         post.return_value = FakeResponse(payload={"job_id": "a" * 32})
         get.side_effect = [app.requests.RequestException("busy"), FakeResponse(payload={"status": "ready", "internal_id": "A203781"})]
+        self.assertEqual(app.ai_package_photos(self.payload()), [photos / "01.jpg"])
+
+    @mock.patch.object(app.requests, "get")
+    @mock.patch.object(app.requests, "post")
+    def test_windows_ai_reuses_last_certified_package_after_retry_failure(self, post, get):
+        ai_root = Path(self.temp.name) / "ai-packages"
+        photos = ai_root / "B95B6E5C759" / "photos"
+        photos.mkdir(parents=True)
+        (photos / "01.jpg").write_bytes(b"certified")
+        app.AI_ENDPOINT = "http://127.0.0.1:8793"
+        app.AI_PACKAGES_ROOT = ai_root
+        post.return_value = FakeResponse(payload={"job_id": "b" * 32})
+        get.return_value = FakeResponse(payload={"status": "failed", "internal_id": "B95B6E5C759", "error": "two source files failed"})
         self.assertEqual(app.ai_package_photos(self.payload()), [photos / "01.jpg"])
 
     def test_wsgi_health_and_existing_interface(self):
