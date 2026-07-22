@@ -826,8 +826,10 @@ def bridge_ai_package_photos(payload):
     bridge_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
     request_payload = {
-        "mode": "server", "value": payload.get("internal_id") or payload.get("source"),
+        "mode": "browser", "value": payload.get("internal_id") or payload.get("source"),
         "url": payload.get("source"), "photo_urls": payload.get("images", []),
+        "title": payload.get("translations", {}).get("uk", {}).get("title", ""),
+        "description": payload.get("translations", {}).get("uk", {}).get("text", ""),
     }
     with database() as db:
         db.execute("INSERT INTO ai_bridge_jobs(id,payload_json,status,created_at,updated_at) VALUES(?,?,?,?,?)",
