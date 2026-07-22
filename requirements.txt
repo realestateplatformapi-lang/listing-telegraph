@@ -1,3 +1,4 @@
 requests>=2.31
+truststore>=0.10.4,<1
 gunicorn>=23.0
 reportlab>=4.2

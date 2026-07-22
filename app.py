@@ -20,6 +20,13 @@ from socketserver import ThreadingMixIn
 from urllib.parse import urljoin, urlparse
 from wsgiref.simple_server import WSGIServer, make_server
 
+import truststore
+
+# This is an application entry point, so using the operating-system trust store
+# here is intentional. On Windows it keeps Requests aligned with browsers and
+# CryptoAPI without weakening certificate verification.
+truststore.inject_into_ssl()
+
 import requests
 
 ROOT = Path(__file__).parent
