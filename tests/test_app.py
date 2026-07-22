@@ -124,18 +124,29 @@ class AppTests(unittest.TestCase):
 
     @mock.patch.object(app, "safe_remote_url", return_value=True)
     @mock.patch.object(app.requests, "get")
-    def test_package_keeps_user_photo_order(self, get, _safe):
+    def test_ai_package_keeps_only_checked_photos_in_user_order(self, get, _safe):
         get.side_effect = [
             FakeResponse(content=b"first" * 1024, url="https://images.example/first.jpg"),
             FakeResponse(content=b"second" * 1024, url="https://images.example/second.jpg"),
         ]
         payload = self.payload()
         payload["images"] = ["https://images.example/first.jpg", "https://images.example/second.jpg"]
-        payload["processing_mode"] = "browser"
-        payload["media_choices"] = [{"order": 2, "kind": "processed"}, {"order": 1, "kind": "processed"}]
+        payload["processing_mode"] = "ai"
+        payload["media_choices"] = [{"order": 2, "kind": "processed"}]
         app.create_package(payload)
         manifest = json.loads((app.PACKAGES_ROOT / "203781/manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual([item["order"] for item in manifest["photos"]], [2, 1])
+        self.assertEqual([item["order"] for item in manifest["photos"]], [2])
+        self.assertEqual([path.name for path in (app.PACKAGES_ROOT / "203781/photos").iterdir()], ["02.jpg"])
+
+    @mock.patch.object(app, "safe_remote_url", return_value=True)
+    @mock.patch.object(app.requests, "get")
+    def test_ai_package_rejects_when_all_photos_are_unchecked(self, get, _safe):
+        get.return_value = FakeResponse(content=b"image" * 1024)
+        payload = self.payload()
+        payload["processing_mode"] = "ai"
+        payload["media_choices"] = []
+        with self.assertRaisesRegex(ValueError, "Жодну фотографію"):
+            app.create_package(payload)
 
     def test_telegraph_content_places_logo_after_primary_photo(self):
         content = app.telegraph_content(
@@ -145,6 +156,14 @@ class AppTests(unittest.TestCase):
         )
         images = [node["attrs"]["src"] for node in content if node.get("tag") == "img"]
         self.assertEqual(images[:2], ["https://telegra.ph/file/main.jpg", "https://telegra.ph/file/logo.jpg"])
+        logo_index = next(index for index, node in enumerate(content) if node.get("tag") == "img" and node["attrs"]["src"].endswith("logo.jpg"))
+        phone_index = next(index for index, node in enumerate(content) if node.get("tag") == "p" and any(isinstance(child, dict) and str(child.get("attrs", {}).get("href", "")).startswith("tel:") for child in node.get("children", [])))
+        price_index = next(index for index, node in enumerate(content) if node.get("tag") == "h3")
+        self.assertLess(logo_index, phone_index)
+        self.assertLess(phone_index, price_index)
+        hrefs = [child.get("attrs", {}).get("href") for node in content for child in node.get("children", []) if isinstance(child, dict) and child.get("tag") == "a"]
+        self.assertIn("https://kyiv.estate/", hrefs)
+        self.assertIn("https://t.me/Real_Estate_Agency_premium", hrefs)
 
     @mock.patch.object(app, "github_media_images")
     def test_durable_media_preserves_photo_and_logo_order(self, upload):

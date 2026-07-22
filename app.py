@@ -50,14 +50,14 @@ LOGO_PATH = Path(os.environ.get("KYIV_ESTATE_LOGO_PATH", str(ROOT / "assets" / "
 PUBLIC_BASE_URL = os.environ.get("KYIV_ESTATE_PUBLIC_BASE_URL", "").strip().rstrip("/")
 if not PUBLIC_BASE_URL and os.environ.get("RAILWAY_PUBLIC_DOMAIN"):
     PUBLIC_BASE_URL = "https://" + os.environ["RAILWAY_PUBLIC_DOMAIN"].strip().strip("/")
-CONTACT_PHONE = os.environ.get("KYIV_ESTATE_PHONE", "").strip()
-CONTACT_URL = os.environ.get("KYIV_ESTATE_URL", "").strip()
+CONTACT_PHONE = os.environ.get("KYIV_ESTATE_PHONE", "+380 98 155 9900").strip()
+CONTACT_URL = os.environ.get("KYIV_ESTATE_URL", "https://kyiv.estate/").strip()
 CONTACT_LINKS = {
     "Instagram": os.environ.get("KYIV_ESTATE_INSTAGRAM", "").strip(),
-    "Telegram": os.environ.get("KYIV_ESTATE_TELEGRAM", "").strip(),
-    "WhatsApp": os.environ.get("KYIV_ESTATE_WHATSAPP", "").strip(),
+    "Telegram": os.environ.get("KYIV_ESTATE_TELEGRAM", "https://t.me/Real_Estate_Agency_premium").strip(),
+    "WhatsApp": os.environ.get("KYIV_ESTATE_WHATSAPP", "https://api.whatsapp.com/send/?phone=380981559900&text&type=phone_number&app_absent=0").strip(),
     "Facebook": os.environ.get("KYIV_ESTATE_FACEBOOK", "").strip(),
-    "Email": os.environ.get("KYIV_ESTATE_EMAIL", "").strip(),
+    "Email": os.environ.get("KYIV_ESTATE_EMAIL", "info@kyiv.estate").strip(),
 }
 AI_ENDPOINT = os.environ.get("KYIV_ESTATE_AI_ENDPOINT", "").strip().rstrip("/")
 AI_PACKAGES_ROOT = Path(os.environ.get("KYIV_ESTATE_AI_PACKAGES_ROOT", "")) if os.environ.get("KYIV_ESTATE_AI_PACKAGES_ROOT") else None
@@ -665,6 +665,11 @@ def telegraph_content(payload, language, text, images=None, logo_url=None):
     logo_url = logo_url or (LOGO_URL if LOGO_URL.startswith("https://") else "")
     if logo_url:
         content.append({"tag": "img", "attrs": {"src": logo_url}})
+    if CONTACT_PHONE:
+        content.append({"tag": "p", "children": [
+            {"tag": "b", "children": ["Контакти: " if language == "uk" else "Contacts: "]},
+            {"tag": "a", "attrs": {"href": "tel:" + re.sub(r"[^0-9+]", "", CONTACT_PHONE)}, "children": [CONTACT_PHONE]},
+        ]})
     price_parts = [f"{prices.get(code)} {code}" for code in ("UAH", "USD", "EUR") if prices.get(code)]
     if price_parts:
         content.append({"tag": "h3", "children": ["💰 " + price_label]})
@@ -686,6 +691,8 @@ def telegraph_content(payload, language, text, images=None, logo_url=None):
         content.append({"tag": "img", "attrs": {"src": image}})
     contacts = []
     for label, url in agency_links():
+        if label == "Phone":
+            continue
         if contacts:
             contacts.append(" · ")
         display = CONTACT_PHONE if label == "Phone" else label
@@ -1035,13 +1042,19 @@ def create_package(payload):
     originals_root.mkdir(parents=True, exist_ok=True)
     assets_root.mkdir(parents=True, exist_ok=True)
     approved = save_approved_photos(job_id, payload.get("images", []), payload)
-    requested_choices = payload.get("media_choices", [])
-    if requested_choices:
+    requested_choices = payload.get("media_choices") if str(payload.get("processing_mode") or "ai").lower() == "ai" else None
+    if requested_choices is not None:
         requested_order = [int(item["order"]) for item in requested_choices if str(item.get("order", "")).isdigit()]
         approved_by_order = {int(item["order"]): item for item in approved}
         approved = [approved_by_order[order] for order in requested_order if order in approved_by_order]
     if not approved:
         raise ValueError("Жодну фотографію не вдалося зберегти й перевірити.")
+    # A rebuilt package must contain only the currently checked photographs.
+    # Otherwise files from an earlier, larger selection remain accessible on disk.
+    for media_root in (photos_root, originals_root):
+        for stale_file in media_root.iterdir():
+            if stale_file.is_file():
+                stale_file.unlink()
     media_choices = {int(item.get("order")): item.get("kind") for item in payload.get("media_choices", []) if str(item.get("order", "")).isdigit()}
     for item in approved:
         choice = media_choices.get(int(item["order"]), "processed")
@@ -1149,9 +1162,9 @@ def make_pdf(payload):
             manifest_path = PACKAGES_ROOT / job_id / "manifest.json"
             if manifest_path.is_file():
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                local_photos = [local_root / item["filename"] for item in manifest.get("photos", []) if (local_root / item.get("filename", "")).is_file()][:10]
+                local_photos = [local_root / item["filename"] for item in manifest.get("photos", []) if (local_root / item.get("filename", "")).is_file()][:MAX_PHOTOS]
             else:
-                local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:10]
+                local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:MAX_PHOTOS]
     def append_pdf_image(source):
         if isinstance(source, (bytes, bytearray)):
             reader_source, image_source = BytesIO(source), BytesIO(source)
@@ -1167,7 +1180,7 @@ def make_pdf(payload):
         photo_sources = local_photos
     else:
         photo_sources = []
-        for url in payload.get("images", [])[:10]:
+        for url in payload.get("images", [])[:MAX_PHOTOS]:
             if not safe_remote_url(url):
                 continue
             try:
@@ -1184,9 +1197,17 @@ def make_pdf(payload):
                 append_pdf_image(ensure_local_logo())
         except Exception:
             continue
-    contacts = " · ".join(part for part in (CONTACT_PHONE, CONTACT_URL) if part)
-    if contacts:
-        story.extend([Spacer(1, 0.35 * cm), Paragraph(f"{contacts_label}: {html.escape(contacts)}", normal)])
+    pdf_contacts = []
+    for label, url in agency_links():
+        display = CONTACT_PHONE if label == "Phone" else label
+        pdf_contacts.append(
+            f'<a href="{html.escape(url, quote=True)}">{html.escape(display)}</a>'
+        )
+    if pdf_contacts:
+        story.extend([
+            Spacer(1, 0.35 * cm),
+            Paragraph(f"{contacts_label}: " + " · ".join(pdf_contacts), normal),
+        ])
     document.build(story)
     return output.getvalue()
 
