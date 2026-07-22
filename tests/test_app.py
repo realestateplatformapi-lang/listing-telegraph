@@ -105,6 +105,10 @@ class AppTests(unittest.TestCase):
             "Apartment",
         )
 
+    def test_initial_ai_request_does_not_look_like_all_photos_unchecked(self):
+        interface = (app.ROOT / "index.html").read_text(encoding="utf-8")
+        self.assertIn("if(!mediaPairs.length)return null", interface)
+
     @mock.patch.object(app, "safe_remote_url", return_value=True)
     @mock.patch.object(app.requests, "get")
     def test_package_persists_original_final_logo_and_manifest(self, get, _safe):
