@@ -113,6 +113,21 @@ class AppTests(unittest.TestCase):
         self.assertLess(html.index("photos/01.jpg"), html.index("assets/kyiv-estate-logo.jpg"))
         self.assertEqual(manifest["ai_processing"]["result"], "original_verified")
 
+    @mock.patch.object(app, "safe_remote_url", return_value=True)
+    @mock.patch.object(app.requests, "get")
+    def test_package_keeps_user_photo_order(self, get, _safe):
+        get.side_effect = [
+            FakeResponse(content=b"first" * 1024, url="https://images.example/first.jpg"),
+            FakeResponse(content=b"second" * 1024, url="https://images.example/second.jpg"),
+        ]
+        payload = self.payload()
+        payload["images"] = ["https://images.example/first.jpg", "https://images.example/second.jpg"]
+        payload["processing_mode"] = "browser"
+        payload["media_choices"] = [{"order": 2, "kind": "processed"}, {"order": 1, "kind": "processed"}]
+        app.create_package(payload)
+        manifest = json.loads((app.PACKAGES_ROOT / "203781/manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual([item["order"] for item in manifest["photos"]], [2, 1])
+
     def test_telegraph_content_places_logo_after_primary_photo(self):
         content = app.telegraph_content(
             self.payload(), "uk", "Опис квартири.",

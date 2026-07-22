@@ -939,8 +939,9 @@ def create_package(payload):
     approved = save_approved_photos(job_id, payload.get("images", []), payload)
     requested_choices = payload.get("media_choices", [])
     if requested_choices:
-        included_orders = {int(item["order"]) for item in requested_choices if str(item.get("order", "")).isdigit()}
-        approved = [item for item in approved if int(item["order"]) in included_orders]
+        requested_order = [int(item["order"]) for item in requested_choices if str(item.get("order", "")).isdigit()]
+        approved_by_order = {int(item["order"]): item for item in approved}
+        approved = [approved_by_order[order] for order in requested_order if order in approved_by_order]
     if not approved:
         raise ValueError("Жодну фотографію не вдалося зберегти й перевірити.")
     media_choices = {int(item.get("order")): item.get("kind") for item in payload.get("media_choices", []) if str(item.get("order", "")).isdigit()}
@@ -1047,7 +1048,12 @@ def make_pdf(payload):
         job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("internal_id", "")))
         local_root = PACKAGES_ROOT / job_id / "photos"
         if local_root.is_dir():
-            local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:10]
+            manifest_path = PACKAGES_ROOT / job_id / "manifest.json"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                local_photos = [local_root / item["filename"] for item in manifest.get("photos", []) if (local_root / item.get("filename", "")).is_file()][:10]
+            else:
+                local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:10]
     def append_pdf_image(source):
         if isinstance(source, (bytes, bytearray)):
             reader_source, image_source = BytesIO(source), BytesIO(source)
