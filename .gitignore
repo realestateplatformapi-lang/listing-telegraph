@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+data/
+windows/WINDOWS_CONFIG.ps1
+.DS_Store

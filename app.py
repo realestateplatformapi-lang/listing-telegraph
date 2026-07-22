@@ -1,11 +1,15 @@
-"""Local MVP: turn an OLX/Rieltor listing into a Telegraph article."""
+"""KYIV ESTATE: turn a listing into bilingual Telegraph-ready pages."""
 import html
+import hashlib
 import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
+import sqlite3
 import time
+from datetime import datetime, timezone
 from io import BytesIO
 from html.parser import HTMLParser
 from pathlib import Path
@@ -16,9 +20,15 @@ import requests
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("PORT", "8080"))
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", str(ROOT / "data")))
+PACKAGES_ROOT = DATA_ROOT / "packages"
+DB_PATH = DATA_ROOT / "block3.sqlite3"
 ALLOWED_ROOT_DOMAINS = ("olx.ua", "rieltor.ua")
 TELEGRAPH_API = "https://api.telegra.ph"
 ACCESS_TOKEN = os.environ.get("TELEGRAPH_ACCESS_TOKEN")
+LOGO_URL = os.environ.get("KYIV_ESTATE_LOGO_URL", "").strip()
+CONTACT_PHONE = os.environ.get("KYIV_ESTATE_PHONE", "").strip()
+CONTACT_URL = os.environ.get("KYIV_ESTATE_URL", "").strip()
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -26,6 +36,63 @@ REQUEST_HEADERS = {
 }
 LISTING_CACHE = {}
 CACHE_TTL_SECONDS = 60 * 60 * 6
+RATE_CACHE = {"at": 0, "value": None}
+BANNED_PUBLIC_PHRASES = (
+    "olx", "rieltor", "рієлтор", "риелтор", "коміс", "власник",
+    "агентств", "зателефон", "дзвон", "зустріч", "internal review draft",
+)
+
+
+def init_storage():
+    PACKAGES_ROOT.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                input_value TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                snapshot_json TEXT,
+                package_path TEXT,
+                uk_url TEXT,
+                en_url TEXT,
+                error TEXT,
+                retries INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
+def update_job(job_id, input_value, phase, progress=0, snapshot=None, package_path=None, uk_url=None, en_url=None, error=None):
+    init_storage()
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute("""
+            INSERT INTO jobs (id, input_value, phase, progress, snapshot_json, package_path, uk_url, en_url, error)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                phase=excluded.phase, progress=excluded.progress,
+                snapshot_json=COALESCE(excluded.snapshot_json, jobs.snapshot_json),
+                package_path=COALESCE(excluded.package_path, jobs.package_path),
+                uk_url=COALESCE(excluded.uk_url, jobs.uk_url),
+                en_url=COALESCE(excluded.en_url, jobs.en_url),
+                error=excluded.error, updated_at=CURRENT_TIMESTAMP
+        """, (job_id, input_value, phase, progress, json.dumps(snapshot, ensure_ascii=False) if snapshot else None, package_path, uk_url, en_url, error))
+
+
+def normalize_listing_input(raw):
+    value = str(raw or "").strip()
+    if re.fullmatch(r"\d{5,12}", value):
+        return f"https://rieltor.ua/flats-sale/view/{value}/"
+    return value
+
+
+def listing_id(source_url):
+    parsed = urlparse(source_url)
+    match = re.search(r"/(?:view/)?(\d{5,12})(?:/|$)", parsed.path)
+    if match:
+        return match.group(1)
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", parsed.path).strip("-")[-48:]
+    return slug or hashlib.sha256(source_url.encode()).hexdigest()[:12]
 
 
 class ListingParser(HTMLParser):
@@ -108,6 +175,16 @@ def reject_unsafe_url(raw):
             raise ValueError("Небезпечна адреса сайту.")
 
 
+def safe_remote_url(raw):
+    parsed = urlparse(str(raw))
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    try:
+        return all(ipaddress.ip_address(item[4][0]).is_global for item in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM))
+    except socket.gaierror:
+        return False
+
+
 def first(data, *keys):
     for key in keys:
         values = data.get(key.lower(), [])
@@ -127,7 +204,10 @@ def flatten_jsonld(value):
 
 
 def extract_listing(source_url):
+    source_url = normalize_listing_input(source_url)
     reject_unsafe_url(source_url)
+    job_id = listing_id(source_url)
+    update_job(job_id, source_url, "resolve", 10)
     cache_key = source_url.rstrip("/")
     cached = LISTING_CACHE.get(cache_key)
     if cached and time.time() - cached[0] < CACHE_TTL_SECONDS:
@@ -153,8 +233,10 @@ def extract_listing(source_url):
                 pass
             time.sleep(delay)
     if response.status_code == 429:
+        update_job(job_id, source_url, "error", 10, error="Rieltor rate limit")
         raise ValueError("Rieltor тимчасово обмежив запити. Зачекайте 1–2 хвилини й повторіть спробу.")
     response.raise_for_status()
+    update_job(job_id, source_url, "ingest", 30)
     parser = ListingParser()
     parser.feed(response.text)
     title = first(parser.meta, "og:title", "twitter:title") or parser.title.strip()
@@ -184,8 +266,23 @@ def extract_listing(source_url):
         raise ValueError("Не вдалося прочитати оголошення. Можливо, сайт запросив перевірку або змінив розмітку.")
     page_plain = html.unescape(re.sub(r"<[^>]*>", " ", response.text))
     page_plain = re.sub(r"\s+", " ", page_plain)
-    listing = {"title": html.unescape(title).strip(), "description": html.unescape(description).strip(), "images": clean_images[:20], "source": response.url, "details": extract_details(page_plain)}
+    clean_title = sanitize_title(html.unescape(title).strip())
+    clean_description = sanitize_public_text(html.unescape(description).strip())
+    detail_text = " ".join(parser.meta.get("og:description", [])) + " " + page_plain
+    details = extract_details(detail_text)
+    prices = convert_prices(details.get("price"), details.get("currency"))
+    listing = {
+        "internal_id": job_id,
+        "title": clean_title,
+        "description": clean_description,
+        "images": clean_images[:20],
+        "source": response.url,
+        "details": details,
+        "prices": prices,
+        "phase": "ready",
+    }
     LISTING_CACHE[cache_key] = (time.time(), listing)
+    update_job(job_id, source_url, "ready", 100, snapshot=listing)
     return listing
 
 
@@ -193,12 +290,74 @@ def extract_details(page_text):
     def match(pattern):
         found = re.search(pattern, page_text, re.IGNORECASE)
         return found.groups() if found else ()
-    price = match(r"(?<!\d)([\d\s\u00a0]+(?:[.,]\d+)?)\s*(USD|EUR|грн\.?|\$|€|₴)(?!\w)")
+    price = match(r"(?<!\d)(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(USD|EUR|грн\.?|\$|€|₴)(?!\w)")
     # Listings often show total/living/kitchen area as "72 / 20 / 30 m²".
     area = match(r"(\d+(?:[.,]\d+)?)\s*/\s*\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\s*(?:м²|м2|m²|m2)") or match(r"(\d+(?:[.,]\d+)?)\s*(?:м²|м2|m²|m2)")
-    floor = match(r"(\d+)\s*(?:поверх|пов\.)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*поверх\s*(\d+)\s*-?\s*пов")
+    floor = match(r"(?:поверх|пов\.)\s*(\d+)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*(?:поверх|пов\.)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*поверх\s*(\d+)\s*-?\s*пов")
     currency = {"$": "USD", "USD": "USD", "€": "EUR", "EUR": "EUR", "₴": "UAH", "грн": "UAH", "грн.": "UAH"}
     return {"price": price[0].strip() if price else "", "currency": currency.get(price[1].upper(), "UAH") if price else "UAH", "area": area[0] if area else "", "floor": "/".join(floor) if floor else ""}
+
+
+def sanitize_title(value):
+    value = re.sub(r"\s*[-|·]\s*(?:RIELTOR\.UA|OLX(?:\.UA)?)\s*$", "", value, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", value).strip(" \"'—-")
+
+
+def sanitize_public_text(value):
+    value = html.unescape(re.sub(r"<[^>]+>", " ", value))
+    value = re.sub(r"[\t\r ]+", " ", value)
+    kept = []
+    for paragraph in re.split(r"\n+", value):
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
+        safe = [sentence.strip(" \"'") for sentence in sentences if sentence.strip() and not any(phrase in sentence.lower() for phrase in BANNED_PUBLIC_PHRASES)]
+        if safe:
+            kept.append(" ".join(safe))
+    return "\n\n".join(kept).strip()
+
+
+def nbu_rates():
+    if RATE_CACHE["value"] and time.time() - RATE_CACHE["at"] < 60 * 60 * 6:
+        return RATE_CACHE["value"]
+    response = requests.get("https://bank.gov.ua/NBUStatService/v1/statdirectory/exchangenew", params={"json": ""}, timeout=15)
+    response.raise_for_status()
+    by_code = {row.get("cc"): row for row in response.json()}
+    if "USD" not in by_code or "EUR" not in by_code:
+        raise RuntimeError("НБУ не повернув курси USD та EUR.")
+    value = {
+        "USD": float(by_code["USD"]["rate"]),
+        "EUR": float(by_code["EUR"]["rate"]),
+        "date": by_code["USD"].get("exchangedate", ""),
+        "source": "National Bank of Ukraine",
+    }
+    RATE_CACHE.update({"at": time.time(), "value": value})
+    return value
+
+
+def parse_number(value):
+    cleaned = re.sub(r"[^\d,.-]", "", str(value or "")).replace(",", ".")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def convert_prices(value, currency):
+    amount = parse_number(value)
+    if amount is None:
+        return {"UAH": "", "USD": "", "EUR": "", "rate_date": "", "rate_source": ""}
+    try:
+        rates = nbu_rates()
+    except (requests.RequestException, RuntimeError, ValueError):
+        return {"UAH": str(value).strip(), "USD": "", "EUR": "", "rate_date": "", "rate_source": "unavailable"} if currency == "UAH" else {"UAH": "", "USD": str(value).strip() if currency == "USD" else "", "EUR": str(value).strip() if currency == "EUR" else "", "rate_date": "", "rate_source": "unavailable"}
+    uah = amount if currency == "UAH" else amount * rates[currency]
+    result = {
+        "UAH": str(round(uah)),
+        "USD": str(round(uah / rates["USD"])),
+        "EUR": str(round(uah / rates["EUR"])),
+        "rate_date": rates["date"],
+        "rate_source": rates["source"],
+    }
+    return result
 
 
 def translate_to_english(text):
@@ -227,33 +386,155 @@ def token():
     return ACCESS_TOKEN
 
 
-def publish(payload):
-    title = str(payload.get("title", "")).strip()
-    text = str(payload.get("text", "")).strip()
-    source = str(payload.get("source", "")).strip()
-    images = payload.get("images", [])
-    if not title or not isinstance(images, list):
-        raise ValueError("Потрібні заголовок і коректний список фотографій.")
-    language = payload.get("language", "uk")
+def telegraph_content(payload, language, text):
     details = payload.get("details", {})
-    labels = {"uk": ("Ціна", "Площа", "Поверх", "Джерело: оголошення"), "en": ("Price", "Area", "Floor", "Source: listing")}
-    price_label, area_label, floor_label, source_label = labels.get(language, labels["uk"])
+    prices = payload.get("prices", {})
+    images = [url for url in payload.get("images", []) if isinstance(url, str) and url.startswith("https://")][:20]
+    labels = {
+        "uk": ("Ціна", "Площа", "Поверх", "Контакти"),
+        "en": ("Price", "Area", "Floor", "Contacts"),
+    }
+    price_label, area_label, floor_label, contacts_label = labels.get(language, labels["uk"])
     content = []
-    detail_lines = [(price_label, f"{details.get('price', '')} {details.get('currency', '')}".strip()), (area_label, f"{details.get('area', '')} m²".strip()), (floor_label, details.get("floor", ""))]
-    for label, value in detail_lines:
+    if images:
+        content.append({"tag": "img", "attrs": {"src": images[0]}})
+    if LOGO_URL.startswith("https://"):
+        content.append({"tag": "img", "attrs": {"src": LOGO_URL}})
+    price_parts = [f"{prices.get(code)} {code}" for code in ("UAH", "USD", "EUR") if prices.get(code)]
+    if price_parts:
+        content.append({"tag": "p", "children": [{"tag": "b", "children": [f"{price_label}: "]}, " · ".join(price_parts)]})
+    for label, value in ((area_label, f"{details.get('area')} m²" if details.get("area") else ""), (floor_label, details.get("floor", ""))):
         if value:
-            content.append({"tag": "p", "children": [{"tag": "b", "children": [f"{label}: "]}, value]})
-    for paragraph in text.splitlines():
-        if paragraph.strip(): content.append({"tag": "p", "children": [paragraph.strip()]})
-    for image in images[:20]:
-        if isinstance(image, str) and image.startswith("https://"):
-            content.append({"tag": "img", "attrs": {"src": image}})
-    if source:
-        content.append({"tag": "p", "children": [{"tag": "a", "attrs": {"href": source}, "children": [source_label]}]})
+            content.append({"tag": "p", "children": [{"tag": "b", "children": [f"{label}: "]}, str(value)]})
+    for paragraph in sanitize_public_text(text).splitlines():
+        if paragraph.strip():
+            content.append({"tag": "p", "children": [paragraph.strip()]})
+    for image in images[1:]:
+        content.append({"tag": "img", "attrs": {"src": image}})
+    contacts = []
+    if CONTACT_PHONE:
+        contacts.append({"tag": "a", "attrs": {"href": f"tel:{CONTACT_PHONE}"}, "children": [CONTACT_PHONE]})
+    if CONTACT_URL.startswith("https://"):
+        if contacts: contacts.append(" · ")
+        contacts.append({"tag": "a", "attrs": {"href": CONTACT_URL}, "children": ["KYIV ESTATE"]})
+    if contacts:
+        content.append({"tag": "p", "children": [{"tag": "b", "children": [f"{contacts_label}: "]}, *contacts]})
+    return content
+
+
+def publish_page(title, content):
     result = requests.post(f"{TELEGRAPH_API}/createPage", json={"access_token": token(), "title": title[:256], "content": json.dumps(content, ensure_ascii=False), "return_content": False}, timeout=25).json()
     if not result.get("ok"):
         raise RuntimeError(result.get("error", "Telegraph не зміг створити сторінку."))
     return result["result"]["url"]
+
+
+def publish_bilingual(payload):
+    translations = payload.get("translations", {})
+    uk = translations.get("uk", {})
+    en = translations.get("en", {})
+    if not uk.get("title") or not uk.get("text") or not en.get("title") or not en.get("text"):
+        raise ValueError("Потрібні готові українська й англійська версії.")
+    job_id = str(payload.get("internal_id") or listing_id(str(payload.get("source", ""))))
+    update_job(job_id, str(payload.get("source", "")), "publishing", 90)
+    urls = {
+        "uk": publish_page(str(uk["title"]), telegraph_content(payload, "uk", str(uk["text"]))),
+        "en": publish_page(str(en["title"]), telegraph_content(payload, "en", str(en["text"]))),
+    }
+    update_job(job_id, str(payload.get("source", "")), "published", 100, uk_url=urls["uk"], en_url=urls["en"])
+    return urls
+
+
+def save_approved_photos(job_id, image_urls):
+    listing_root = DATA_ROOT / "listings" / job_id
+    original_root = listing_root / "original"
+    final_root = listing_root / "final"
+    original_root.mkdir(parents=True, exist_ok=True)
+    final_root.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for index, url in enumerate(image_urls[:20], 1):
+        if not safe_remote_url(url):
+            continue
+        try:
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=15)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "").lower()
+            extension = ".png" if "png" in content_type else ".webp" if "webp" in content_type else ".jpg"
+            name = f"{index:02d}{extension}"
+            original_path = original_root / name
+            final_path = final_root / name
+            if not original_path.exists():
+                original_path.write_bytes(response.content)
+            shutil.copy2(original_path, final_path)
+            saved.append({
+                "order": index,
+                "source_url": url,
+                "selected": "original",
+                "approved": True,
+                "original_path": str(original_path),
+                "final_path": str(final_path),
+                "filename": name,
+                "sha256": hashlib.sha256(response.content).hexdigest(),
+            })
+        except requests.RequestException:
+            continue
+    return saved
+
+
+def render_package_page(language, record, photos):
+    translations = record["translations"]
+    version = translations[language]
+    labels = {"uk": ("Ціна", "Площа", "Поверх", "English", "Контакти"), "en": ("Price", "Area", "Floor", "Українська", "Contacts")}
+    price_label, area_label, floor_label, other_label, contacts_label = labels[language]
+    other_file = "en.html" if language == "uk" else "uk.html"
+    prices = " · ".join(f"{html.escape(str(record['prices'].get(code)))} {code}" for code in ("UAH", "USD", "EUR") if record["prices"].get(code))
+    image_tags = [f'<img src="photos/{html.escape(item["filename"])}" alt="KYIV ESTATE property photo {item["order"]}">' for item in photos]
+    main_image = image_tags[0] if image_tags else ""
+    remaining_images = "".join(image_tags[1:])
+    logo = '<img class="logo" src="assets/kyiv-estate-logo.jpg" alt="KYIV ESTATE">' if (PACKAGES_ROOT / record["internal_id"] / "assets" / "kyiv-estate-logo.jpg").exists() else '<div class="brand">KYIV ESTATE</div>'
+    phone = f'<a href="tel:{html.escape(CONTACT_PHONE)}">{html.escape(CONTACT_PHONE)}</a>' if CONTACT_PHONE else ""
+    website = f'<a href="{html.escape(CONTACT_URL)}">KYIV ESTATE</a>' if CONTACT_URL.startswith("https://") else ""
+    contacts = " · ".join(part for part in (phone, website) if part)
+    return f'''<!doctype html><html lang="{language}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(version["title"])}</title><style>*{{box-sizing:border-box}}body{{max-width:760px;margin:0 auto;padding:42px 22px;color:#111;background:#fff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Arial,sans-serif;line-height:1.55}}h1{{font-size:34px;line-height:1.15}}nav{{margin:14px 0 28px}}a{{color:#111}}img{{display:block;width:100%;height:auto;margin:22px 0}}.logo{{max-width:220px;margin:22px auto}}.brand{{margin:22px 0;padding:24px;text-align:center;border:1px solid #ddd;font-weight:700;letter-spacing:.16em}}.facts{{border-top:1px solid #ddd;border-bottom:1px solid #ddd;padding:16px 0;margin:24px 0}}.facts p{{margin:6px 0}}.description{{white-space:pre-line}}footer{{margin-top:32px;padding-top:18px;border-top:1px solid #ddd}}</style><body><h1>{html.escape(record["internal_id"])} · {html.escape(version["title"])}</h1><nav><a href="{other_file}">{other_label}</a></nav>{main_image}{logo}<section class="facts"><p><b>{price_label}:</b> {prices}</p><p><b>{area_label}:</b> {html.escape(str(record["details"].get("area", "")))} m²</p><p><b>{floor_label}:</b> {html.escape(str(record["details"].get("floor", "")))}</p></section><div class="description">{html.escape(sanitize_public_text(version["text"]))}</div>{remaining_images}<footer><b>{contacts_label}:</b> {contacts}</footer></body></html>'''
+
+
+def create_package(payload):
+    translations = payload.get("translations", {})
+    if not translations.get("uk", {}).get("text") or not translations.get("en", {}).get("text"):
+        raise ValueError("Для пакета потрібні українська й англійська версії.")
+    job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("internal_id", ""))) or hashlib.sha256(str(payload.get("source", "")).encode()).hexdigest()[:12]
+    package_root = PACKAGES_ROOT / job_id
+    photos_root = package_root / "photos"
+    assets_root = package_root / "assets"
+    photos_root.mkdir(parents=True, exist_ok=True)
+    assets_root.mkdir(parents=True, exist_ok=True)
+    approved = save_approved_photos(job_id, payload.get("images", []))
+    for item in approved:
+        shutil.copy2(item["final_path"], photos_root / item["filename"])
+    if LOGO_URL.startswith("https://") and safe_remote_url(LOGO_URL):
+        try:
+            logo_response = requests.get(LOGO_URL, timeout=15)
+            logo_response.raise_for_status()
+            (assets_root / "kyiv-estate-logo.jpg").write_bytes(logo_response.content)
+        except requests.RequestException:
+            pass
+    manifest_photos = [{**{key: value for key, value in item.items() if key not in {"original_path", "final_path"}}, "original_path": f"listings/{job_id}/original/{item['filename']}", "final_path": f"listings/{job_id}/final/{item['filename']}"} for item in approved]
+    record = {
+        "internal_id": job_id,
+        "source": payload.get("source", ""),
+        "translations": translations,
+        "details": payload.get("details", {}),
+        "prices": payload.get("prices", {}),
+        "photos": manifest_photos,
+        "languages": ["uk", "en"],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (package_root / "manifest.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    (package_root / "uk.html").write_text(render_package_page("uk", record, approved), encoding="utf-8")
+    (package_root / "en.html").write_text(render_package_page("en", record, approved), encoding="utf-8")
+    (package_root / "index.html").write_text('<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0; url=uk.html">', encoding="utf-8")
+    update_job(job_id, str(payload.get("source", "")), "ready", 100, snapshot=record, package_path=str(package_root))
+    return {"internal_id": job_id, "uk": f"/packages/{job_id}/uk.html", "en": f"/packages/{job_id}/en.html", "manifest": f"/packages/{job_id}/manifest.json", "photo_count": len(approved)}
 
 
 def make_pdf(payload):
@@ -272,13 +553,20 @@ def make_pdf(payload):
     if not title:
         raise ValueError("Потрібен заголовок для PDF.")
     language = payload.get("language", "uk")
-    labels = {"uk": ("Ціна", "Площа", "Поверх", "Джерело"), "en": ("Price", "Area", "Floor", "Source")}
-    price_label, area_label, floor_label, source_label = labels.get(language, labels["uk"])
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    labels = {"uk": ("Ціна", "Площа", "Поверх", "Контакти"), "en": ("Price", "Area", "Floor", "Contacts")}
+    price_label, area_label, floor_label, contacts_label = labels.get(language, labels["uk"])
+    font_candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    font_path = next((candidate for candidate in font_candidates if os.path.exists(candidate)), "")
     font_name = "Helvetica"
-    if os.path.exists(font_path):
-        pdfmetrics.registerFont(TTFont("DejaVu", font_path))
-        font_name = "DejaVu"
+    if font_path:
+        pdfmetrics.registerFont(TTFont("KYIVEstateUnicode", font_path))
+        font_name = "KYIVEstateUnicode"
     styles = getSampleStyleSheet()
     normal = ParagraphStyle("listing", parent=styles["BodyText"], fontName=font_name, leading=17, spaceAfter=8)
     heading = ParagraphStyle("listing-title", parent=styles["Title"], fontName=font_name, leading=28, textColor=colors.HexColor("#168acd"))
@@ -286,7 +574,9 @@ def make_pdf(payload):
     document = SimpleDocTemplate(output, pagesize=A4, rightMargin=1.6 * cm, leftMargin=1.6 * cm, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
     story = [Paragraph(title, heading), Spacer(1, 0.3 * cm)]
     details = payload.get("details", {})
-    rows = [(price_label, f"{details.get('price', '')} {details.get('currency', '')}".strip()), (area_label, f"{details.get('area', '')} m²".strip()), (floor_label, details.get("floor", ""))]
+    prices = payload.get("prices", {})
+    price_text = " · ".join(f"{prices.get(code)} {code}" for code in ("UAH", "USD", "EUR") if prices.get(code))
+    rows = [(price_label, price_text), (area_label, f"{details.get('area', '')} m²".strip()), (floor_label, details.get("floor", ""))]
     rows = [[Paragraph(html.escape(label), normal), Paragraph(html.escape(value), normal)] for label, value in rows if value]
     if rows:
         table = Table(rows, colWidths=[4 * cm, 12 * cm])
@@ -295,6 +585,8 @@ def make_pdf(payload):
     for paragraph in str(payload.get("text", "")).splitlines():
         if paragraph.strip(): story.append(Paragraph(html.escape(paragraph.strip()), normal))
     for url in payload.get("images", [])[:10]:
+        if not safe_remote_url(url):
+            continue
         try:
             response = requests.get(url, timeout=12)
             response.raise_for_status()
@@ -304,9 +596,9 @@ def make_pdf(payload):
             story.extend([Spacer(1, 0.25 * cm), Image(BytesIO(response.content), width=width * ratio, height=height * ratio)])
         except Exception:
             continue
-    source = str(payload.get("source", ""))
-    if source:
-        story.extend([Spacer(1, 0.35 * cm), Paragraph(f"{source_label}: {html.escape(source)}", normal)])
+    contacts = " · ".join(part for part in (CONTACT_PHONE, CONTACT_URL) if part)
+    if contacts:
+        story.extend([Spacer(1, 0.35 * cm), Paragraph(f"{contacts_label}: {html.escape(contacts)}", normal)])
     document.build(story)
     return output.getvalue()
 
@@ -325,11 +617,21 @@ def pdf_reply(start_response, body):
 def app(environ, start_response):
     path, method = environ["PATH_INFO"], environ["REQUEST_METHOD"]
     try:
+        if path == "/health" and method == "GET":
+            return reply(start_response, "200 OK", {"ok": True, "service": "KYIV ESTATE"})
         if path == "/" and method == "GET":
             body = (ROOT / "index.html").read_bytes()
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
             return [body]
-        if path in {"/api/extract", "/api/publish", "/api/translate", "/api/pdf"} and method == "POST":
+        if path.startswith("/packages/") and method == "GET":
+            requested = (PACKAGES_ROOT / path.removeprefix("/packages/")).resolve()
+            if PACKAGES_ROOT.resolve() not in requested.parents or not requested.is_file():
+                return reply(start_response, "404 Not Found", {"error": "Не знайдено"})
+            content_type = "text/html; charset=utf-8" if requested.suffix == ".html" else "application/json; charset=utf-8" if requested.suffix == ".json" else "image/png" if requested.suffix == ".png" else "image/webp" if requested.suffix == ".webp" else "image/jpeg"
+            body = requested.read_bytes()
+            start_response("200 OK", [("Content-Type", content_type), ("Content-Length", str(len(body)))])
+            return [body]
+        if path in {"/api/extract", "/api/publish", "/api/translate", "/api/pdf", "/api/package"} and method == "POST":
             length = int(environ.get("CONTENT_LENGTH") or 0)
             payload = json.loads(environ["wsgi.input"].read(length) or b"{}")
             if path.endswith("extract"):
@@ -338,7 +640,9 @@ def app(environ, start_response):
                 return reply(start_response, "200 OK", {"title": translate_to_english(str(payload.get("title", ""))), "text": translate_to_english(str(payload.get("text", "")))})
             if path.endswith("pdf"):
                 return pdf_reply(start_response, make_pdf(payload))
-            return reply(start_response, "200 OK", {"url": publish(payload)})
+            if path.endswith("package"):
+                return reply(start_response, "200 OK", create_package(payload))
+            return reply(start_response, "200 OK", {"urls": publish_bilingual(payload)})
         return reply(start_response, "404 Not Found", {"error": "Не знайдено"})
     except (ValueError, requests.RequestException, RuntimeError) as error:
         return reply(start_response, "400 Bad Request", {"error": str(error)})
