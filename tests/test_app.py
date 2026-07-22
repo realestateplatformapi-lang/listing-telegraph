@@ -92,11 +92,12 @@ class AppTests(unittest.TestCase):
             "https://rieltor-images.lunstatic.net/rieltor-ua-01/120/120/avatars/1.jpg",
             "https://market-images.lunstatic.net/lun-ua/310/310/images/offers/preview.jpg",
             "https://market-images.lunstatic.net/lun-ua/t.1.0.0/1600/1200/images/offers/room.jpg",
+            "https://rieltor-images.lunstatic.net/rieltor-ua-01/1920/1440/offers/full-size.jpg",
             "https://rieltor.ua/img/mastercard.svg",
         ]
         self.assertEqual(
             app.listing_photo_urls(images, "https://rieltor.ua/flats-rent/view/12883087/"),
-            [images[3]],
+            [images[3], images[4]],
         )
 
     def test_title_rejects_rieltor_resource_tail(self):

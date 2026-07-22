@@ -278,7 +278,14 @@ def listing_photo_urls(images, page_url):
         host, path = (parsed.hostname or "").lower(), parsed.path.lower()
         keep = True
         if page_host.endswith("rieltor.ua"):
-            keep = host == "market-images.lunstatic.net" and "/images/offers/" in path and "/310/310/" not in path
+            # Rieltor migrated its gallery from market-images to
+            # rieltor-images.lunstatic.net. Both are first-party offer media;
+            # avatars, tiny previews and site art still remain excluded.
+            keep = (
+                host in {"market-images.lunstatic.net", "rieltor-images.lunstatic.net"}
+                and ("/images/offers/" in path or "/offers/" in path)
+                and "/310/310/" not in path
+            )
         elif page_host.endswith("olx.ua"):
             keep = host.endswith("apollo.olxcdn.com") and "/v1/files/" in path
         if keep and image not in accepted:
@@ -333,6 +340,14 @@ def extract_listing(source_url):
     else:
         description = description or page_text
     images = parser.meta.get("og:image", []) + parser.meta.get("twitter:image", []) + parser.images
+    if (urlparse(response.url).hostname or "").endswith("rieltor.ua"):
+        # The current Rieltor gallery keeps full-size images in picture/srcset
+        # attributes instead of img[src]. Extract only non-WebP offer originals.
+        images.extend(re.findall(
+            r"https://(?:market-images|rieltor-images)\.lunstatic\.net/[^\"'<>\s]*/offers/[^\"'<>\s]+?\.(?:jpe?g|png)(?:\?[^\"'<>\s]*)?",
+            response.text,
+            re.IGNORECASE,
+        ))
     for item in flatten_jsonld(parser.json_ld):
         title = title or str(item.get("name", ""))
         description = description or str(item.get("description", ""))
