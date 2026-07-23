@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from io import BytesIO
@@ -371,13 +372,13 @@ def extract_listing(source_url):
     detail_text = " ".join(parser.meta.get("og:description", [])) + " " + page_plain
     details = extract_details(detail_text)
     prices = convert_prices(details.get("price"), details.get("currency"))
-    clean_images = listing_photo_urls(clean_images, response.url)
+    clean_images = visually_unique_preview_urls(listing_photo_urls(clean_images, response.url))
     listing = {
         "internal_id": job_id,
         "title": clean_title,
         "description": clean_description,
         "original_description": html.unescape(description).strip(),
-        "images": clean_images[:MAX_PHOTOS],
+        "images": clean_images,
         "source": response.url,
         "details": details,
         "prices": prices,
@@ -527,12 +528,55 @@ def visual_fingerprint(path):
     return width, height, value
 
 
+def visual_fingerprint_bytes(content):
+    with Image.open(BytesIO(content)) as source:
+        image = ImageOps.exif_transpose(source).convert("L")
+        width, height = image.size
+        pixels = list(image.resize((17, 16), Image.Resampling.LANCZOS).getdata())
+    value = 0
+    for row in range(16):
+        start = row * 17
+        for column in range(16):
+            value = (value << 1) | int(pixels[start + column] > pixels[start + column + 1])
+    return width, height, value
+
+
 def same_visual_photo(candidate, fingerprints):
     width, height, signature = visual_fingerprint(candidate)
     for other_width, other_height, other_signature in fingerprints:
         if abs(width / max(height, 1) - other_width / max(other_height, 1)) < 0.005 and (signature ^ other_signature).bit_count() <= 3:
             return True
     return False
+
+
+def visually_unique_preview_urls(urls):
+    """Remove re-encoded duplicate frames before the browser renders its grid."""
+    urls = clean_image_urls(urls)
+    def fetch(index_url):
+        index, url = index_url
+        try:
+            response = requests.get(url, headers=REQUEST_HEADERS, timeout=12)
+            response.raise_for_status()
+            if not response.headers.get("Content-Type", "").lower().startswith("image/"):
+                return index, url, None
+            return index, url, visual_fingerprint_bytes(response.content)
+        except (requests.RequestException, OSError, ValueError):
+            return index, url, None
+    fetched = {}
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        for future in as_completed([pool.submit(fetch, item) for item in enumerate(urls)]):
+            index, url, signature = future.result()
+            fetched[index] = (url, signature)
+    result, fingerprints = [], []
+    for index in range(len(urls)):
+        url, signature = fetched.get(index, (urls[index], None))
+        if signature is not None:
+            width, height, value = signature
+            if any(abs(width / max(height, 1) - ow / max(oh, 1)) < 0.005 and (value ^ ov).bit_count() <= 3 for ow, oh, ov in fingerprints):
+                continue
+            fingerprints.append(signature)
+        result.append(url)
+    return result
 
 
 def ensure_local_logo():
