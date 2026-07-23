@@ -1095,6 +1095,38 @@ def render_package_page(language, record, photos):
     return f'''<!doctype html><html lang="{language}"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(version["title"])}</title><style>*{{box-sizing:border-box}}body{{max-width:760px;margin:0 auto;padding:42px 22px;color:#111;background:#fff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","Helvetica Neue",Arial,sans-serif;line-height:1.55}}h1{{font-size:34px;line-height:1.15}}nav{{margin:14px 0 28px}}a{{color:#111}}img{{display:block;width:100%;height:auto;margin:22px 0}}.logo{{max-width:220px;margin:22px auto}}.brand{{margin:22px 0;padding:24px;text-align:center;border:1px solid #ddd;font-weight:700;letter-spacing:.16em}}.facts{{border-top:1px solid #ddd;border-bottom:1px solid #ddd;padding:16px 0;margin:24px 0}}.facts p{{margin:6px 0}}.description{{white-space:pre-line}}footer{{margin-top:32px;padding-top:18px;border-top:1px solid #ddd}}</style><body><h1>{html.escape(record["internal_id"])} · {html.escape(version["title"])}</h1><nav><a href="{other_file}">{other_label}</a></nav>{main_image}{logo}<section class="facts"><p><b>{price_label}:</b> {prices}</p><p><b>{area_label}:</b> {html.escape(str(record["details"].get("area", "")))} m²</p><p><b>{floor_label}:</b> {html.escape(str(record["details"].get("floor", "")))}</p></section><div class="description">{html.escape(sanitize_public_text(version["text"]))}</div>{remaining_images}<footer><b>{contacts_label}:</b> {contacts}<p><b>{html.escape(slogan)}</b></p></footer></body></html>'''
 
 
+def repair_existing_packages_once():
+    """Repair old static packages after deployment without downloading them again."""
+    marker = DATA_ROOT / ".package-repair-v2.complete"
+    if marker.exists():
+        return
+    for package_root in PACKAGES_ROOT.iterdir() if PACKAGES_ROOT.exists() else []:
+        manifest_path = package_root / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            record = json.loads(manifest_path.read_text(encoding="utf-8"))
+            unique, seen = [], set()
+            for item in record.get("photos", []):
+                image_path = package_root / "photos" / str(item.get("filename", ""))
+                if not image_path.is_file():
+                    continue
+                digest = file_sha256(image_path)
+                if digest in seen:
+                    image_path.unlink()
+                    continue
+                seen.add(digest)
+                unique.append({**item, "order": len(unique) + 1, "sha256": digest})
+            if unique:
+                record["photos"] = unique
+                manifest_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+                (package_root / "uk.html").write_text(render_package_page("uk", record, unique), encoding="utf-8")
+                (package_root / "en.html").write_text(render_package_page("en", record, unique), encoding="utf-8")
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    marker.write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+
+
 def create_package(payload):
     translations = payload.get("translations", {})
     if not translations.get("uk", {}).get("text") or not translations.get("en", {}).get("text"):
@@ -1357,6 +1389,12 @@ def app(environ, start_response):
         return reply(start_response, "400 Bad Request", {"error": str(error)})
     except Exception:
         return reply(start_response, "500 Internal Server Error", {"error": "Внутрішня помилка сервісу."})
+
+
+# Railway imports this module once per deployment, which makes the migration
+# safe for the static packages already stored on its persistent volume.
+init_storage()
+repair_existing_packages_once()
 
 
 if __name__ == "__main__":
