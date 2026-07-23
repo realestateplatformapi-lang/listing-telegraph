@@ -32,6 +32,7 @@ truststore.inject_into_ssl()
 
 import requests
 from bs4 import BeautifulSoup
+from PIL import Image, ImageOps
 
 ROOT = Path(__file__).parent
 PORT = int(os.environ.get("PORT", "8080"))
@@ -512,6 +513,28 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
+def visual_fingerprint(path):
+    """256-bit dHash: catches the same photograph after re-encoding."""
+    with Image.open(path) as source:
+        image = ImageOps.exif_transpose(source).convert("L")
+        width, height = image.size
+        pixels = list(image.resize((17, 16), Image.Resampling.LANCZOS).getdata())
+    value = 0
+    for row in range(16):
+        start = row * 17
+        for column in range(16):
+            value = (value << 1) | int(pixels[start + column] > pixels[start + column + 1])
+    return width, height, value
+
+
+def same_visual_photo(candidate, fingerprints):
+    width, height, signature = visual_fingerprint(candidate)
+    for other_width, other_height, other_signature in fingerprints:
+        if abs(width / max(height, 1) - other_width / max(other_height, 1)) < 0.005 and (signature ^ other_signature).bit_count() <= 3:
+            return True
+    return False
+
+
 def ensure_local_logo():
     """Keep the canonical logo on persistent storage for packages and Telegraph."""
     target = DATA_ROOT / "assets" / "kyiv-estate-logo.jpg"
@@ -984,6 +1007,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
         return cached
     saved = []
     saved_hashes = set()
+    saved_visual_hashes = []
     for url in image_urls:
         if not safe_remote_url(url):
             continue
@@ -999,6 +1023,14 @@ def save_approved_photos(job_id, image_urls, payload=None):
             digest = hashlib.sha256(response.content).hexdigest()
             if digest in saved_hashes:
                 continue
+            temporary_path = original_root / f".fingerprint-{uuid.uuid4().hex}{extension}"
+            temporary_path.write_bytes(response.content)
+            try:
+                if same_visual_photo(temporary_path, saved_visual_hashes):
+                    continue
+                saved_visual_hashes.append(visual_fingerprint(temporary_path))
+            finally:
+                temporary_path.unlink(missing_ok=True)
             saved_hashes.add(digest)
             index = len(saved) + 1
             name = f"{index:02d}{extension}"
@@ -1030,11 +1062,15 @@ def save_approved_photos(job_id, image_urls, payload=None):
                     if candidates:
                         break
             source_hashes = set()
+            source_visual_hashes = []
             for source_path in candidates[:MAX_PHOTOS]:
                 digest = file_sha256(source_path)
                 if digest in source_hashes:
                     continue
+                if same_visual_photo(source_path, source_visual_hashes):
+                    continue
                 source_hashes.add(digest)
+                source_visual_hashes.append(visual_fingerprint(source_path))
                 index = len(saved) + 1
                 extension = source_path.suffix.lower() if source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
                 name = f"{index:02d}{extension}"
@@ -1047,11 +1083,15 @@ def save_approved_photos(job_id, image_urls, payload=None):
                 })
         ai_saved = []
         ai_hashes = set()
+        ai_visual_hashes = []
         for source_path in processed:
             digest = file_sha256(source_path)
             if digest in ai_hashes:
                 continue
+            if same_visual_photo(source_path, ai_visual_hashes):
+                continue
             ai_hashes.add(digest)
+            ai_visual_hashes.append(visual_fingerprint(source_path))
             index = len(ai_saved) + 1
             extension = source_path.suffix.lower() if source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
             name = f"{index:02d}{extension}"
@@ -1097,7 +1137,7 @@ def render_package_page(language, record, photos):
 
 def repair_existing_packages_once():
     """Repair old static packages after deployment without downloading them again."""
-    marker = DATA_ROOT / ".package-repair-v2.complete"
+    marker = DATA_ROOT / ".package-repair-v3-visual.complete"
     if marker.exists():
         return
     for package_root in PACKAGES_ROOT.iterdir() if PACKAGES_ROOT.exists() else []:
@@ -1106,7 +1146,7 @@ def repair_existing_packages_once():
             continue
         try:
             record = json.loads(manifest_path.read_text(encoding="utf-8"))
-            unique, seen = [], set()
+            unique, seen, visual_hashes = [], set(), []
             for item in record.get("photos", []):
                 image_path = package_root / "photos" / str(item.get("filename", ""))
                 if not image_path.is_file():
@@ -1115,7 +1155,11 @@ def repair_existing_packages_once():
                 if digest in seen:
                     image_path.unlink()
                     continue
+                if same_visual_photo(image_path, visual_hashes):
+                    image_path.unlink()
+                    continue
                 seen.add(digest)
+                visual_hashes.append(visual_fingerprint(image_path))
                 unique.append({**item, "order": len(unique) + 1, "sha256": digest})
             if unique:
                 record["photos"] = unique
