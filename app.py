@@ -1329,7 +1329,12 @@ def app(environ, start_response):
     path, method = environ["PATH_INFO"], environ["REQUEST_METHOD"]
     try:
         if path == "/health" and method == "GET":
-            return reply(start_response, "200 OK", {"ok": True, "service": "KYIV ESTATE"})
+            return reply(start_response, "200 OK", {
+                "ok": True,
+                "service": "KYIV ESTATE",
+                "version": "1.1.0-dedupe",
+                "revision": os.environ.get("RAILWAY_GIT_COMMIT_SHA", "ca725db")[:7],
+            })
         if path == "/" and method == "GET":
             body = (ROOT / "index.html").read_bytes()
             start_response("200 OK", [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
