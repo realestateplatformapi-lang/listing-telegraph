@@ -371,6 +371,7 @@ def extract_listing(source_url):
     clean_description = sanitize_public_text(html.unescape(description).strip())
     detail_text = " ".join(parser.meta.get("og:description", [])) + " " + page_plain
     details = extract_details(detail_text)
+    details["address"] = extract_address(detail_text, response.url)
     prices = convert_prices(details.get("price"), details.get("currency"))
     clean_images = visually_unique_preview_urls(listing_photo_urls(clean_images, response.url))
     listing = {
@@ -399,6 +400,20 @@ def extract_details(page_text):
     floor = match(r"(?:поверх|пов\.)\s*(\d+)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*(?:поверх|пов\.)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*поверх\s*(\d+)\s*-?\s*пов")
     currency = {"$": "USD", "USD": "USD", "€": "EUR", "EUR": "EUR", "₴": "UAH", "грн": "UAH", "грн.": "UAH"}
     return {"price": price[0].strip() if price else "", "currency": currency.get(price[1].upper(), "UAH") if price else "UAH", "area": area[0] if area else "", "floor": "/".join(floor) if floor else ""}
+
+
+def extract_address(page_text, source_url):
+    if "rieltor.ua" not in source_url.lower():
+        return ""
+    patterns = (
+        r"(?:Київ|Киев)\s*[,·-]?\s*[^,]{0,55}?(?:вул\.|вулиця|проспект|пр-т|наб\.|пров\.)\s*[^,]{2,70}",
+        r"(?:вул\.|вулиця|проспект|пр-т|наб\.|пров\.)\s*[^,]{2,70}",
+    )
+    for pattern in patterns:
+        found = re.search(pattern, page_text, re.IGNORECASE)
+        if found:
+            return re.sub(r"\s+", " ", found.group(0)).strip(" ,·-")
+    return ""
 
 
 def sanitize_title(value):
