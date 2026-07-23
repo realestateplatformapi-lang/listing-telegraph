@@ -172,6 +172,7 @@ class AppTests(unittest.TestCase):
         hrefs = [child.get("attrs", {}).get("href") for node in content for child in node.get("children", []) if isinstance(child, dict) and child.get("tag") == "a"]
         self.assertIn("https://kyiv.estate/", hrefs)
         self.assertIn("https://t.me/Real_Estate_Agency_premium", hrefs)
+        self.assertEqual(content[-1]["children"][0]["children"], ["🏛 Kyiv.Estate — Агентство нерухомості №1 в Києві."])
 
     @mock.patch.object(app, "github_media_images")
     def test_durable_media_preserves_photo_and_logo_order(self, upload):
