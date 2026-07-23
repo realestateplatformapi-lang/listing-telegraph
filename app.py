@@ -874,8 +874,9 @@ def publish_bilingual(payload):
     else:
         media_urls = durable_image_urls([*local_images, package_logo], job_id)
         image_urls, logo_url = media_urls[:-1], media_urls[-1]
-    uk_title = f"{job_id} · {uk['title']}"
-    en_title = f"{job_id} · {en['title']}"
+    show_title = bool(payload.get("include_title"))
+    uk_title = f"{job_id} · {uk['title']}" if show_title else job_id
+    en_title = f"{job_id} · {en['title']}" if show_title else job_id
     uk_content = telegraph_content(payload, "uk", str(uk["text"]), image_urls, logo_url)
     en_content = telegraph_content(payload, "en", str(en["text"]), image_urls, logo_url)
     previous = manifest.get("telegraph", {})
@@ -1324,8 +1325,9 @@ def make_pdf(payload):
         from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
     except ImportError as error:
         raise RuntimeError("PDF-модуль не встановлено. Перезапустіть застосунок через start.command.") from error
-    title = html.escape(str(payload.get("title", "")).strip())
-    if not title:
+    show_title = bool(payload.get("include_title"))
+    title = html.escape(str(payload.get("title", "")).strip()) if show_title else ""
+    if show_title and not title:
         raise ValueError("Потрібен заголовок для PDF.")
     language = payload.get("language", "uk")
     labels = {"uk": ("Ціна", "Площа", "Поверх", "Контакти"), "en": ("Price", "Area", "Floor", "Contacts")}
@@ -1347,7 +1349,7 @@ def make_pdf(payload):
     heading = ParagraphStyle("listing-title", parent=styles["Title"], fontName=font_name, leading=28, textColor=colors.HexColor("#168acd"))
     output = BytesIO()
     document = SimpleDocTemplate(output, pagesize=A4, rightMargin=1.6 * cm, leftMargin=1.6 * cm, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
-    story = [Paragraph(title, heading), Spacer(1, 0.3 * cm)]
+    story = [Paragraph(title, heading), Spacer(1, 0.3 * cm)] if title else []
     details = payload.get("details", {})
     prices = payload.get("prices", {})
     price_text = " · ".join(f"{prices.get(code)} {code}" for code in ("UAH", "USD", "EUR") if prices.get(code))
