@@ -20,7 +20,7 @@ from io import BytesIO
 from html.parser import HTMLParser
 from pathlib import Path
 from socketserver import ThreadingMixIn
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 from wsgiref.simple_server import WSGIServer, make_server
 
 import truststore
@@ -409,12 +409,39 @@ def sanitize_public_text(value):
     value = html.unescape(re.sub(r"<[^>]+>", " ", value))
     value = re.sub(r"[\t\r ]+", " ", value)
     kept = []
+    seen_sentences = set()
     for paragraph in re.split(r"\n+", value):
         sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
-        safe = [sentence.strip(" \"'") for sentence in sentences if sentence.strip() and not any(phrase in sentence.lower() for phrase in BANNED_PUBLIC_PHRASES)]
+        safe = []
+        for sentence in sentences:
+            sentence = sentence.strip(" \"'")
+            key = re.sub(r"\s+", " ", sentence).casefold()
+            if not sentence or key in seen_sentences or any(phrase in key for phrase in BANNED_PUBLIC_PHRASES):
+                continue
+            seen_sentences.add(key)
+            safe.append(sentence)
         if safe:
             kept.append(" ".join(safe))
     return "\n\n".join(kept).strip()
+
+
+def clean_image_urls(image_urls):
+    """Keep source order, but never request the same remote image twice."""
+    cleaned = []
+    seen = set()
+    for value in image_urls or []:
+        if not isinstance(value, str) or not safe_remote_url(value):
+            continue
+        parsed = urlparse(value.strip())
+        # Fragment identifiers never select a different image and cause false duplicates.
+        normalized = urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, parsed.params, parsed.query, ""))
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(value.strip())
+        if len(cleaned) >= MAX_PHOTOS:
+            break
+    return cleaned
 
 
 def nbu_rates():
@@ -945,6 +972,7 @@ def existing_approved_photos(job_id, image_urls, processing_mode="ai"):
 
 
 def save_approved_photos(job_id, image_urls, payload=None):
+    image_urls = clean_image_urls(image_urls)
     listing_root = DATA_ROOT / "listings" / job_id
     original_root = listing_root / "original"
     final_root = listing_root / "final"
@@ -955,7 +983,8 @@ def save_approved_photos(job_id, image_urls, payload=None):
     if cached:
         return cached
     saved = []
-    for index, url in enumerate(image_urls[:MAX_PHOTOS], 1):
+    saved_hashes = set()
+    for url in image_urls:
         if not safe_remote_url(url):
             continue
         try:
@@ -967,6 +996,11 @@ def save_approved_photos(job_id, image_urls, payload=None):
             if not content_type.startswith("image/") or len(response.content) < 1024 or len(response.content) > 30 * 1024 * 1024:
                 continue
             extension = ".png" if "png" in content_type else ".webp" if "webp" in content_type else ".jpg"
+            digest = hashlib.sha256(response.content).hexdigest()
+            if digest in saved_hashes:
+                continue
+            saved_hashes.add(digest)
+            index = len(saved) + 1
             name = f"{index:02d}{extension}"
             original_path = original_root / name
             final_path = final_root / name
@@ -981,7 +1015,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
                 "original_path": str(original_path),
                 "final_path": str(final_path),
                 "filename": name,
-                "sha256": hashlib.sha256(response.content).hexdigest(),
+                "sha256": digest,
             })
         except requests.RequestException:
             continue
@@ -995,7 +1029,13 @@ def save_approved_photos(job_id, image_urls, payload=None):
                     candidates = sorted(path for path in candidate.iterdir() if path.is_file())
                     if candidates:
                         break
-            for index, source_path in enumerate(candidates[:MAX_PHOTOS], 1):
+            source_hashes = set()
+            for source_path in candidates[:MAX_PHOTOS]:
+                digest = file_sha256(source_path)
+                if digest in source_hashes:
+                    continue
+                source_hashes.add(digest)
+                index = len(saved) + 1
                 extension = source_path.suffix.lower() if source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
                 name = f"{index:02d}{extension}"
                 original_path = original_root / name
@@ -1006,7 +1046,13 @@ def save_approved_photos(job_id, image_urls, payload=None):
                     "original_path": str(original_path),
                 })
         ai_saved = []
-        for index, source_path in enumerate(processed, 1):
+        ai_hashes = set()
+        for source_path in processed:
+            digest = file_sha256(source_path)
+            if digest in ai_hashes:
+                continue
+            ai_hashes.add(digest)
+            index = len(ai_saved) + 1
             extension = source_path.suffix.lower() if source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
             name = f"{index:02d}{extension}"
             final_path = final_root / name
@@ -1021,7 +1067,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
                 "original_path": original["original_path"] if original else "",
                 "final_path": str(final_path),
                 "filename": name,
-                "sha256": file_sha256(final_path),
+                "sha256": digest,
             })
         saved = ai_saved
     elif payload and processing_mode == "ai" and AI_REQUIRED:
@@ -1053,6 +1099,8 @@ def create_package(payload):
     translations = payload.get("translations", {})
     if not translations.get("uk", {}).get("text") or not translations.get("en", {}).get("text"):
         raise ValueError("Для пакета потрібні українська й англійська версії.")
+    payload = dict(payload)
+    payload["images"] = clean_image_urls(payload.get("images", []))
     job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("internal_id", ""))) or hashlib.sha256(str(payload.get("source", "")).encode()).hexdigest()[:12]
     package_root = PACKAGES_ROOT / job_id
     existing_manifest = package_root / "manifest.json"
@@ -1063,7 +1111,7 @@ def create_package(payload):
     photos_root.mkdir(parents=True, exist_ok=True)
     originals_root.mkdir(parents=True, exist_ok=True)
     assets_root.mkdir(parents=True, exist_ok=True)
-    approved = save_approved_photos(job_id, payload.get("images", []), payload)
+    approved = save_approved_photos(job_id, payload["images"], payload)
     requested_choices = payload.get("media_choices") if str(payload.get("processing_mode") or "ai").lower() == "ai" else None
     if requested_choices is not None:
         requested_order = [int(item["order"]) for item in requested_choices if str(item.get("order", "")).isdigit()]
@@ -1101,7 +1149,7 @@ def create_package(payload):
         "details": payload.get("details", {}),
         "prices": payload.get("prices", {}),
         "photos": manifest_photos,
-        "selected_source_urls": list(payload.get("images", [])[:MAX_PHOTOS]),
+        "selected_source_urls": list(payload["images"]),
         "processing_mode": str(payload.get("processing_mode") or "ai").lower(),
         "ai_processing": {
             "enabled": bool(AI_ENDPOINT or AI_BRIDGE_ENABLED) and str(payload.get("processing_mode") or "ai").lower() == "ai",
